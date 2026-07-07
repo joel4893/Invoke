@@ -17,6 +17,7 @@ import re
 import socket
 import sys
 import textwrap
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -137,19 +138,73 @@ def load_credentials() -> dict[str, str]:
     }
 
 
+def load_config_store() -> dict[str, Any]:
+    """Raw config.json contents (base_url, api_key, workspace_id, ...), legacy-aware."""
+    stored = load_json_file(credentials_path(), {})
+    if not stored and legacy_credentials_path().exists():
+        stored = load_json_file(legacy_credentials_path(), {})
+    return stored if isinstance(stored, dict) else {}
+
+
+def save_config_store(store: dict[str, Any]) -> None:
+    store = dict(store)
+    store["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    write_json_file(credentials_path(), store)
+
+
 def write_credentials(base_url: str, api_key: str) -> None:
     cleaned_base_url = base_url.rstrip("/")
     cleaned_api_key = api_key.strip()
-    write_json_file(
-        credentials_path(),
+    store = load_config_store()
+    store.update(
         {
             "base_url": cleaned_base_url,
             "baseUrl": cleaned_base_url,
             "api_key": cleaned_api_key,
             "apiKey": cleaned_api_key,
-            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        },
+        }
     )
+    save_config_store(store)
+
+
+def stored_workspace() -> str | None:
+    store = load_config_store()
+    value = store.get("workspace_id") or store.get("workspaceId")
+    return str(value) if value else None
+
+
+def set_active_workspace(workspace_id: str) -> None:
+    store = load_config_store()
+    store["workspace_id"] = workspace_id
+    save_config_store(store)
+
+
+def project_workspace(root: Path) -> str | None:
+    """Workspace id pinned in a project's invoke.json, if any."""
+    try:
+        config = load_json_file(root / "invoke.json", {})
+    except ValueError:
+        return None
+    if isinstance(config, dict):
+        value = config.get("workspace_id") or config.get("workspaceId")
+        return str(value) if value else None
+    return None
+
+
+def load_workspace(args: argparse.Namespace) -> str:
+    """Resolve the active workspace id: --workspace > env > project invoke.json > config."""
+    workspace_id = (
+        getattr(args, "workspace", None)
+        or os.getenv("INVOKE_WORKSPACE")
+        or project_workspace(Path.cwd())
+        or stored_workspace()
+    )
+    if not workspace_id:
+        raise CliUsageError(
+            "No Invoke workspace selected. Run `invoke init <name>` to provision one, "
+            "set INVOKE_WORKSPACE, or pass --workspace <id>."
+        )
+    return workspace_id
 
 
 def normalize_config_key(key: str) -> str:
@@ -240,6 +295,18 @@ def require_credentials(args: argparse.Namespace) -> dict[str, str]:
     if not api_key:
         raise CliUsageError("Missing API key. Run `invoke login --api-key ...` or set INVOKE_API_KEY.")
     return {"base_url": base_url, "api_key": api_key}
+
+
+def runtime_request(
+    method: str,
+    credentials: dict[str, str],
+    workspace_id: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Call the workspace-scoped runtime router (/v1/runtime/workspaces/{id}...)."""
+    prefix = f"/v1/runtime/workspaces/{workspace_id}"
+    return api_request(method, credentials["base_url"], f"{prefix}{path}", credentials["api_key"], body)
 
 
 def infer_sql_params(query: str) -> dict[str, Any]:
@@ -980,18 +1047,79 @@ def config_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def status_command(args: argparse.Namespace) -> int:
-    credentials = load_credentials()
-    base_url = args.base_url or credentials["base_url"]
-    api_key = args.api_key or credentials["api_key"]
+def fmt_cost(micros: Any) -> str:
+    try:
+        return f"${int(micros) / 1_000_000:,.2f}"
+    except (TypeError, ValueError):
+        return "$0.00"
+
+
+def fmt_pct(rate: Any) -> str:
+    try:
+        return f"{float(rate) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def event_clock(event: dict[str, Any]) -> str:
+    raw = event.get("at") or event.get("ts")
+    if isinstance(raw, str):
+        try:
+            return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%H:%M:%S")
+        except ValueError:
+            return raw
+    if isinstance(raw, (int, float)):
+        return dt.datetime.fromtimestamp(raw, dt.timezone.utc).strftime("%H:%M:%S")
+    return "--:--:--"
+
+
+# Friendly labels for the ledger event types the log renders.
+EVENT_LABELS: dict[str, str] = {
+    "workspace.created": "Workspace created",
+    "budget.set": "Budget set",
+    "tool.registered": "Tool registered",
+    "agent.registered": "Agent registered",
+    "agent.heartbeat": "Agent heartbeat",
+    "agent.retired": "Agent retired",
+    "task.created": "Task created",
+    "task.assigned": "Task assigned",
+    "task.claimed": "Task claimed",
+    "task.handed_off": "Handoff",
+    "task.status_changed": "Task status changed",
+    "execution.requested": "Execution requested",
+    "execution.started": "Execution started",
+    "execution.completed": "Completed",
+    "execution.failed": "Failed",
+    "execution.denied": "Denied",
+    "execution.deduplicated": "Deduplicated (reconciled)",
+    "approval.requested": "Approval required",
+    "approval.granted": "Approved",
+    "approval.denied": "Rejected",
+    "receipt.issued": "Receipt issued",
+    "context.written": "Context written",
+    "message.broadcast": "Broadcast",
+}
+
+
+def event_summary(event: dict[str, Any]) -> str:
+    etype = event.get("type", "event")
+    label = EVENT_LABELS.get(etype, etype)
+    tool = event.get("tool") or (event.get("payload") or {}).get("tool")
+    if tool and etype.startswith("execution"):
+        return f"{label}: {tool}"
+    return label
+
+
+def status_plain(base_url: str, api_key: str, check: bool) -> int:
     print("Invoke CLI status")
     print(f"Version: {package_version()}")
     print(f"Runtime: {base_url}")
     print(f"API key: {mask_key(api_key)}")
     print(f"Config: {credentials_path()}")
+    print(f"Workspace: {stored_workspace() or '(none)'}")
     project = project_context(Path.cwd())
     print(f"Project: {project or '(none)'}")
-    if args.check:
+    if check:
         if not api_key:
             raise CliUsageError("Cannot check runtime without an API key. Run `invoke login --api-key ...` first.")
         health = api_request("GET", base_url, "/health", api_key)
@@ -999,6 +1127,168 @@ def status_command(args: argparse.Namespace) -> int:
         if health.get("db"):
             print(f"DB: {health.get('db')}")
     return 0
+
+
+def status_command(args: argparse.Namespace) -> int:
+    credentials = load_credentials()
+    base_url = args.base_url or credentials["base_url"]
+    api_key = args.api_key or credentials["api_key"]
+    creds = {"base_url": base_url, "api_key": api_key}
+
+    try:
+        workspace_id = load_workspace(args)
+    except CliUsageError:
+        workspace_id = None
+
+    if args.plain or not workspace_id:
+        if not workspace_id and not args.plain:
+            print("No workspace selected — showing login context. Run `invoke init <name>` to provision one.\n")
+        return status_plain(base_url, api_key, args.check)
+
+    if not api_key:
+        raise CliUsageError("Missing API key. Run `invoke login --api-key ...` or set INVOKE_API_KEY.")
+
+    health: dict[str, Any] = {}
+    try:
+        health = api_request("GET", base_url, "/health", api_key)
+    except RuntimeError:
+        health = {}
+    overview = runtime_request("GET", creds, workspace_id, "/overview").get("overview", {})
+    metrics = runtime_request("GET", creds, workspace_id, "/metrics?window_minutes=1440").get("metrics", {})
+
+    if args.json:
+        print(json.dumps({"health": health, "overview": overview, "metrics": metrics}, indent=2))
+        return 0
+
+    totals = metrics.get("totals", {}) if isinstance(metrics, dict) else {}
+    agents = overview.get("agents", {}) if isinstance(overview, dict) else {}
+    approvals = overview.get("approvals", {}) if isinstance(overview, dict) else {}
+    ws_name = (overview.get("workspace") or {}).get("name") or workspace_id
+    recovery = 1.0 - float(totals.get("failure_rate", 0.0) or 0.0)
+    raw_health = str(health.get("status", "unknown")) if health else "unreachable"
+    health_status = {"ok": "Healthy"}.get(raw_health, raw_health.capitalize())
+
+    print(f"Workspace:        {ws_name} ({workspace_id})")
+    print(f"Runtime:          {health_status}")
+    print(f"Agents:           {agents.get('total', 0)} ({agents.get('live', 0)} live)")
+    print(f"Executions (24h): {int(totals.get('requested', 0)):,}")
+    print(f"Recovery Rate:    {fmt_pct(recovery)}")
+    print(f"Cost (24h):       {fmt_cost(totals.get('spend_micros', 0))}")
+    pending = approvals.get("pending", 0)
+    if pending:
+        print(f"Approvals:        {pending} pending  →  invoke approvals")
+    return 0
+
+
+def print_events(events: list[dict[str, Any]]) -> None:
+    for event in events:
+        print(f"{event_clock(event)}  {event_summary(event)}")
+
+
+def logs_command(args: argparse.Namespace) -> int:
+    creds = require_credentials(args)
+    workspace_id = load_workspace(args)
+    query = f"/events?after_seq={args.since}&limit={args.limit}&order=asc"
+    if args.types:
+        query += f"&types={urllib.parse.quote(args.types)}"
+    response = runtime_request("GET", creds, workspace_id, query)
+    events = response.get("events", [])
+
+    if args.json and not args.follow:
+        print(json.dumps(events, indent=2))
+        return 0
+
+    print_events(events)
+    if not args.follow:
+        if not events:
+            print("(no events yet — run `invoke run <agent>` to produce some)")
+        return 0
+
+    last_seq = response.get("next_after_seq") or (events[-1]["seq"] if events else args.since)
+    print("… following (Ctrl-C to stop)")
+    try:
+        while True:
+            time.sleep(2)
+            follow_query = f"/events?after_seq={last_seq}&limit=100&order=asc"
+            if args.types:
+                follow_query += f"&types={urllib.parse.quote(args.types)}"
+            batch = runtime_request("GET", creds, workspace_id, follow_query)
+            new_events = batch.get("events", [])
+            if new_events:
+                print_events(new_events)
+                last_seq = batch.get("next_after_seq") or new_events[-1]["seq"]
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    return 0
+
+
+TERMINAL_TASK_STATUS = {"done", "cancelled", "failed"}
+
+
+def watch_task(creds: dict[str, str], workspace_id: str, task_id: str, timeout_seconds: int = 15) -> int:
+    """Follow a task's events + status until it settles or we time out."""
+    deadline = time.time() + timeout_seconds
+    last_seq = 0
+    last_status: str | None = None
+    while time.time() < deadline:
+        batch = runtime_request(
+            "GET", creds, workspace_id, f"/events?task_id={task_id}&after_seq={last_seq}&limit=100&order=asc"
+        )
+        events = batch.get("events", [])
+        if events:
+            print_events(events)
+            last_seq = batch.get("next_after_seq") or events[-1]["seq"]
+        task = runtime_request("GET", creds, workspace_id, f"/tasks/{task_id}").get("task", {})
+        status = task.get("status")
+        if status and status != last_status:
+            last_status = status
+            print(f"  · status: {status}")
+        if status in TERMINAL_TASK_STATUS:
+            print(f"✔ Task {status}")
+            return 0 if status == "done" else 1
+        time.sleep(1.5)
+    print(f"… still {last_status or 'queued'} — watch with `invoke logs -f` or `invoke status`.")
+    return 0
+
+
+def run_command(args: argparse.Namespace) -> int:
+    creds = require_credentials(args)
+    workspace_id = load_workspace(args)
+
+    target = args.target
+    title = target
+    payload: dict[str, Any] = {}
+    file_path = Path(target)
+    if file_path.exists() and file_path.suffix.lower() == ".json":
+        loaded = load_json_file(file_path, {})
+        payload = loaded if isinstance(loaded, dict) else {"input": loaded}
+        title = file_path.stem
+    elif file_path.suffix.lower() in {".yaml", ".yml"} and file_path.exists():
+        raise CliUsageError(
+            f"{target} is YAML; the CLI reads JSON specs. Convert it to .json, or pass params with --params."
+        )
+    else:
+        try:
+            parsed = json.loads(args.params)
+        except json.JSONDecodeError as exc:
+            raise CliUsageError(f"--params must be a JSON object: {exc}") from exc
+        payload = parsed if isinstance(parsed, dict) else {"input": parsed}
+
+    body: dict[str, Any] = {"title": title, "payload": payload}
+    response = runtime_request("POST", creds, workspace_id, "/tasks", body)
+    task = response.get("task", {})
+    task_id = task.get("id")
+
+    if args.json:
+        print(json.dumps(response, indent=2))
+        return 0
+
+    print(f"▶ Started task {task_id}: {title}")
+    print(f"  status: {task.get('status', 'queued')}")
+    if args.detach or not task_id:
+        print("  (detached) follow with: invoke logs -f")
+        return 0
+    return watch_task(creds, workspace_id, task_id)
 
 
 def doctor_command(args: argparse.Namespace) -> int:
@@ -1162,6 +1452,70 @@ def sample_sdk_source() -> str:
     )
 
 
+def pin_workspace_to_project(root: Path, workspace_id: str) -> None:
+    """Record the workspace id in the project's invoke.json so the project is self-describing."""
+    config_path = root / "invoke.json"
+    if not config_path.exists():
+        return
+    try:
+        config = load_json_file(config_path, {})
+    except ValueError:
+        return
+    if isinstance(config, dict):
+        config["workspace_id"] = workspace_id
+        write_json_file(config_path, config)
+
+
+def provision_workspace(args: argparse.Namespace, project_name: str, root: Path) -> str | None:
+    """Provision a cloud runtime workspace for a freshly scaffolded project.
+
+    Best-effort: prints the reason and returns None (without failing `init`) when the
+    step is skipped or the runtime is unreachable, so scaffolding still succeeds offline.
+    """
+    if getattr(args, "no_cloud", False):
+        print("↷ Skipped cloud workspace (--no-cloud)")
+        return None
+
+    credentials = load_credentials()
+    base_url = getattr(args, "base_url", None) or credentials["base_url"]
+    api_key = getattr(args, "api_key", None) or credentials["api_key"]
+    if not api_key:
+        print("↷ No API key found — skipped cloud workspace.")
+        print("  Run `invoke login --api-key <key>`, then `invoke init` again (or `invoke deploy`).")
+        return None
+
+    workspace_name = getattr(args, "workspace_name", None) or project_name
+    try:
+        response = api_request("POST", base_url, "/v1/runtime/workspaces", api_key, {"name": workspace_name})
+    except RuntimeError as exc:
+        print(f"↷ Could not provision cloud workspace: {exc}")
+        return None
+
+    workspace = response.get("workspace") if isinstance(response, dict) else None
+    workspace_id = (workspace or {}).get("id")
+    if not workspace_id:
+        print("↷ Runtime did not return a workspace id — skipped.")
+        return None
+
+    set_active_workspace(workspace_id)
+    pin_workspace_to_project(root, workspace_id)
+    print(f'✔ Initialized workspace "{workspace_name}" ({workspace_id})')
+    print(f"✔ Connected to cloud {base_url.rstrip('/')}")
+    return workspace_id
+
+
+def write_local_runtime(root: Path, workspace_id: str | None, base_url: str) -> None:
+    """Drop a local runtime marker so the project knows its workspace/runtime without the cloud."""
+    write_json_file(
+        root / ".invoke" / "runtime.json",
+        {
+            "workspace_id": workspace_id,
+            "base_url": base_url.rstrip("/"),
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+    )
+
+
 def init_command(args: argparse.Namespace) -> int:
     root = Path(args.name)
     project_name = root.name
@@ -1172,8 +1526,12 @@ def init_command(args: argparse.Namespace) -> int:
         template_dir = "claude-agent-sdk" if args.template == "claude-agent" else "gemini-agent"
         label = "Claude Agent SDK" if args.template == "claude-agent" else "Gemini agent"
         path = copy_template(root, template=template_dir, force=args.force)
-        print(f"Created {label} project at {path}")
-        print("Next:")
+        print(f"✔ Created {label} project at {path}")
+        workspace_id = provision_workspace(args, project_name, root)
+        credentials = load_credentials()
+        write_local_runtime(root, workspace_id, getattr(args, "base_url", None) or credentials["base_url"])
+        print("✔ Created local runtime")
+        print("\nNext:")
         print(f"  cd {path}")
         print("  npm install")
         print("  invoke deploy --dry-run")
@@ -1205,8 +1563,12 @@ def init_command(args: argparse.Namespace) -> int:
         ),
         encoding="utf-8",
     )
-    print(f"Created {root}")
-    print("Next:")
+    print(f"✔ Created invoke.json ({root})")
+    workspace_id = provision_workspace(args, project_name, root)
+    credentials = load_credentials()
+    write_local_runtime(root, workspace_id, getattr(args, "base_url", None) or credentials["base_url"])
+    print("✔ Created local runtime")
+    print("\nNext:")
     print(f"  cd {root}")
     print("  invoke deploy --dry-run")
     return 0
@@ -1921,10 +2283,88 @@ def dev_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# The five layers Invoke is built from. Every command maps to exactly one, so the
+# tool reads as one system rather than a bag of subcommands.
+LAYERS: list[tuple[str, str]] = [
+    ("Identity", "who each agent is, what it may do, what it may spend"),
+    ("Context", "one governed source of truth every agent shares, with provenance"),
+    ("Coordination", "agent-to-agent handoffs as a first-class, durable primitive"),
+    ("Execution", "every real action governed like a production transaction: exactly-once, authorized, reconciled, approved if risky, receipted"),
+    ("Observability", "who did what, why, at what cost, and where the bottlenecks are"),
+]
+
+# command -> (layer, one-line summary), used for the layered help view and `invoke layers`.
+COMMAND_LAYERS: dict[str, tuple[str, str]] = {
+    "login": ("Identity", "Authenticate and save runtime credentials"),
+    "auth": ("Identity", "Authenticate (alias for login)"),
+    "config": ("Identity", "Show or update CLI config"),
+    "agents": ("Identity", "List agents / projects deployed from this machine"),
+    "search": ("Context", "Search live docs/context through Invoke"),
+    "workflow": ("Coordination", "Run a packaged multi-step workflow"),
+    "init": ("Execution", "Scaffold a project and provision a workspace"),
+    "deploy": ("Execution", "Deploy runtime, policies, agents, tools"),
+    "run": ("Execution", "Run an agent or a workflow file"),
+    "call": ("Execution", "Call a tool through Invoke"),
+    "execute": ("Execution", "Execute an action through the control boundary"),
+    "preflight": ("Execution", "Simulate an action before execution"),
+    "approvals": ("Execution", "List or resolve pending approvals"),
+    "wrap": ("Execution", "Generate a tool wrapper project"),
+    "dev": ("Execution", "Run a local MCP server for this project"),
+    "tools": ("Execution", "List available tools"),
+    "status": ("Observability", "Runtime health and workspace dashboard"),
+    "logs": ("Observability", "Show or follow the execution event log"),
+    "doctor": ("Observability", "Diagnose credentials and runtime health"),
+    "layers": ("Observability", "Explain the five Invoke layers"),
+}
+
+
+def commands_for_layer(layer: str) -> list[tuple[str, str]]:
+    return [(name, meta[1]) for name, meta in COMMAND_LAYERS.items() if meta[0] == layer]
+
+
+def layered_epilog() -> str:
+    lines = ["commands, by layer:"]
+    for name, definition in LAYERS:
+        lines.append("")
+        lines.append(f"  {name} — {definition}")
+        for cmd, summary in commands_for_layer(name):
+            lines.append(f"    {cmd:<10} {summary}")
+    lines.append("")
+    lines.append("Run `invoke layers` for the model, or `invoke <command> --help` for a command.")
+    return "\n".join(lines)
+
+
+def layers_command(args: argparse.Namespace) -> int:
+    if getattr(args, "json", False):
+        payload = {
+            "layers": [
+                {"name": name, "definition": definition,
+                 "commands": [cmd for cmd, _ in commands_for_layer(name)]}
+                for name, definition in LAYERS
+            ]
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+    print("Invoke is one system with five layers. Every command maps to one:\n")
+    for index, (name, definition) in enumerate(LAYERS, start=1):
+        print(f"{index}. {name}")
+        print(f"   {definition}")
+        cmds = commands_for_layer(name)
+        if cmds:
+            print(f"   commands: {', '.join(cmd for cmd, _ in cmds)}")
+        print()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="invoke", description="Execution reliability infrastructure for AI agents.")
+    parser = argparse.ArgumentParser(
+        prog="invoke",
+        description="Execution reliability infrastructure for AI agents.",
+        epilog=layered_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {package_version()}")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     login = subparsers.add_parser("login", help="Save Invoke runtime credentials.")
     login.add_argument("--base-url", default=DEFAULT_API_URL, help="Invoke runtime URL.")
@@ -1935,6 +2375,9 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--base-url", help="Override Invoke runtime URL.")
     status.add_argument("--api-key", help="Override Invoke API key.")
     status.add_argument("--check", action="store_true", help="Call /health and verify the runtime is reachable.")
+    status.add_argument("--workspace", help="Workspace id to inspect.")
+    status.add_argument("--plain", action="store_true", help="Show CLI/login context instead of the runtime dashboard.")
+    status.add_argument("--json", action="store_true", help="Print the raw status payload as JSON.")
     status.set_defaults(func=status_command)
 
     doctor = subparsers.add_parser("doctor", help="Check credentials and runtime health.")
@@ -1956,6 +2399,10 @@ def build_parser() -> argparse.ArgumentParser:
         default="gemini-agent",
     )
     init.add_argument("--force", action="store_true", help="Write into an existing non-empty directory.")
+    init.add_argument("--no-cloud", action="store_true", help="Skip provisioning a cloud runtime workspace.")
+    init.add_argument("--workspace-name", help="Name for the provisioned workspace (defaults to the project name).")
+    init.add_argument("--base-url", help="Override Invoke runtime URL.")
+    init.add_argument("--api-key", help="Override Invoke API key.")
     init.set_defaults(func=init_command)
 
     deploy = subparsers.add_parser("deploy", help="Register this project with an Invoke runtime.")
@@ -2068,6 +2515,37 @@ def build_parser() -> argparse.ArgumentParser:
     wrap.add_argument("--description", help="Capability description.")
     wrap.add_argument("--output", default="wrapped_tools", help="Output directory.")
     wrap.set_defaults(func=wrap_command)
+
+    layers = subparsers.add_parser("layers", help="Explain the five Invoke layers.")
+    layers.add_argument("--json", action="store_true", help="Print the layer model as JSON.")
+    layers.set_defaults(func=layers_command)
+
+    auth = subparsers.add_parser("auth", help="Authenticate (alias for login).")
+    auth.add_argument("--base-url", default=DEFAULT_API_URL, help="Invoke runtime URL.")
+    auth.add_argument("--api-key", help="Invoke API key. If omitted, prompts interactively.")
+    auth.set_defaults(func=login_command)
+
+    run = subparsers.add_parser("run", help="Run an agent or a workflow file.")
+    run.add_argument("target", help="Agent name, or path to a workflow .yaml/.yml/.json file.")
+    run.add_argument("--params", default="{}", help="JSON params/input for the run.")
+    run.add_argument("--agent-id", default="cli_agent", help="Requesting agent id.")
+    run.add_argument("--workspace", help="Workspace id to run in.")
+    run.add_argument("--detach", action="store_true", help="Start the run and return without waiting.")
+    run.add_argument("--json", action="store_true", help="Print the raw JSON response.")
+    run.add_argument("--base-url", help="Override Invoke runtime URL.")
+    run.add_argument("--api-key", help="Override Invoke API key.")
+    run.set_defaults(func=run_command)
+
+    logs = subparsers.add_parser("logs", help="Show or follow the execution event log.")
+    logs.add_argument("--workspace", help="Workspace id to read.")
+    logs.add_argument("-f", "--follow", action="store_true", help="Stream new events as they occur.")
+    logs.add_argument("--limit", type=int, default=50, help="Max events to show (default 50).")
+    logs.add_argument("--type", dest="types", help="Comma-separated event types to include.")
+    logs.add_argument("--since", type=int, default=0, help="Only events after this sequence number.")
+    logs.add_argument("--json", action="store_true", help="Print raw event JSON.")
+    logs.add_argument("--base-url", help="Override Invoke runtime URL.")
+    logs.add_argument("--api-key", help="Override Invoke API key.")
+    logs.set_defaults(func=logs_command)
 
     return parser
 

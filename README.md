@@ -39,6 +39,22 @@ invoke deploy
 invoke call crm_update_customer '{"customer_id":"cust_123","account_status":"review"}'
 ```
 
+## Commands, by layer
+
+Invoke is one system with five layers, and every command maps to one. Run
+`invoke layers` to see the model, or `invoke --help` for the grouped command list.
+
+| Layer | What it governs | Commands |
+| --- | --- | --- |
+| **Identity** | who each agent is, what it may do, what it may spend | `login` / `auth`, `config`, `agents` |
+| **Context** | one governed source of truth every agent shares, with provenance | `search` |
+| **Coordination** | agent-to-agent handoffs as a first-class, durable primitive | `workflow` |
+| **Execution** | every action governed like a transaction: exactly-once, authorized, reconciled, approved if risky, receipted | `init`, `deploy`, `run`, `call`, `execute`, `preflight`, `approvals`, `wrap`, `dev`, `tools` |
+| **Observability** | who did what, why, at what cost, and where the bottlenecks are | `status`, `logs`, `doctor`, `layers` |
+
+`invoke init <name>` provisions a runtime workspace and pins it locally; `invoke status`
+and `invoke logs` then read that workspace, and `invoke run <agent>` starts work in it.
+
 Then call tools through one execution layer:
 
 ```ts

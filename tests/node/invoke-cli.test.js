@@ -129,3 +129,68 @@ test("common typo alias calls routes to call usage", () => {
   assert.match(result.stderr, /Missing tool/);
   assert.match(result.stderr, /invoke call <tool>/);
 });
+
+function envWithKey() {
+  return { ...isolatedEnv(), INVOKE_API_KEY: "inv_test_offline_key", INVOKE_WORKSPACE: "" };
+}
+
+test("top-level help groups commands by the five layers", () => {
+  const result = spawnSync(process.execPath, [binPath, "--help"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /commands, by layer:/);
+  for (const layer of ["Identity", "Context", "Coordination", "Execution", "Observability"]) {
+    assert.match(result.stdout, new RegExp(`${layer} —`));
+  }
+});
+
+test("layers command explains the five layers", () => {
+  const result = spawnSync(process.execPath, [binPath, "layers"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /1\. Identity/);
+  assert.match(result.stdout, /3\. Coordination/);
+  assert.match(result.stdout, /5\. Observability/);
+});
+
+test("auth is an alias for login", () => {
+  const result = spawnSync(process.execPath, [binPath, "auth", "--help"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /--api-key/);
+});
+
+test("run without a workspace explains how to provision one", () => {
+  const result = spawnSync(process.execPath, [binPath, "run", "support-agent"], {
+    cwd: repoRoot,
+    env: envWithKey(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /No Invoke workspace selected/);
+  assert.match(result.stderr, /invoke init/);
+});
+
+test("logs without a workspace explains how to provision one", () => {
+  const result = spawnSync(process.execPath, [binPath, "logs"], {
+    cwd: repoRoot,
+    env: envWithKey(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /No Invoke workspace selected/);
+});
