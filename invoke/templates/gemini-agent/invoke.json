@@ -1,0 +1,19 @@
+{
+  "name": "my-gemini-agent",
+  "agent_type": "gemini-agent",
+  "entrypoint": "src/index.ts",
+  "runtime": "node",
+  "deploy": {
+    "target": "modal",
+    "tracing": true,
+    "onyx": {
+      "enabled": true,
+      "mode": "auto"
+    }
+  },
+  "tools": [],
+  "policy": {
+    "approval_required_for": ["charge", "refund", "delete", "database.execute"],
+    "block": ["database.execute"]
+  }
+}

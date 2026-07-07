@@ -1,0 +1,42 @@
+name: Publish @invokehq/cli
+
+# Publish is tag-gated (not push-to-main) so a routine commit can never
+# republish the package. Cut a release by pushing a tag: `git tag v0.2.24 && git push --tags`.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run CLI smoke tests
+        run: npm test
+
+      - name: Publish to npm (skip if this version is already published)
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already on npm — nothing to publish."
+          else
+            npm publish --access public
+          fi

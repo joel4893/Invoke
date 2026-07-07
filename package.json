@@ -1,0 +1,53 @@
+{
+  "name": "@invokehq/cli",
+  "version": "0.2.24",
+  "description": "CLI for Invoke, execution reliability infrastructure for AI agents.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joel4893/Invoke.git"
+  },
+  "homepage": "https://github.com/joel4893/Invoke#readme",
+  "bugs": {
+    "url": "https://github.com/joel4893/Invoke/issues"
+  },
+  "bin": {
+    "invoke": "bin/invoke.js",
+    "invokehq": "bin/invoke.js",
+    "agentify": "bin/invoke.js"
+  },
+  "files": [
+    "agentify.py",
+    "bin",
+    "invoke/*.py",
+    "invoke/cli/*.py",
+    "invoke/onyx/*.py",
+    "invoke/sdk/*.py",
+    "invoke/storage/*.py",
+    "invoke/supervisor/*.py",
+    "invoke/templates/agent.py",
+    "invoke/templates/claude-agent-sdk/invoke.json",
+    "invoke/templates/claude-agent-sdk/package.json",
+    "invoke/templates/claude-agent-sdk/src/index.ts",
+    "invoke/templates/claude-agent-sdk/tsconfig.json",
+    "invoke/templates/gemini-agent/invoke.json",
+    "invoke/templates/gemini-agent/package.json",
+    "invoke/templates/gemini-agent/src/index.ts",
+    "invoke/templates/gemini-agent/tsconfig.json",
+    "README.md",
+    "pyproject.toml"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/node/*.test.js"
+  },
+  "keywords": [
+    "invoke",
+    "mcp",
+    "ai-agents",
+    "cli",
+    "npx"
+  ]
+}
