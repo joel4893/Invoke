@@ -628,7 +628,15 @@ def launch_connector_tools(target: str) -> list[dict[str, Any]]:
 
 
 def server_template(tools: list[dict[str, Any]]) -> str:
-    tools_json = json.dumps({tool["name"]: tool for tool in tools}, indent=2, sort_keys=True)
+    # Embed the tool table as a Python literal (True/False/None) — NOT raw JSON.
+    # json.dumps emits true/false/null, which are undefined names in Python and make
+    # the generated server.py raise NameError on import. pprint.pformat renders valid
+    # Python literals while keeping the table readable.
+    import pprint
+
+    tools_json = pprint.pformat(
+        {tool["name"]: tool for tool in tools}, indent=2, sort_dicts=True, width=100
+    )
     return (
         '''#!/usr/bin/env python3
 """Generated Invoke MCP wrapper."""
