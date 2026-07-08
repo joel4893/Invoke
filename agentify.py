@@ -28,6 +28,9 @@ from typing import Any
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 LAUNCH_CONNECTORS = {"github", "notion", "linear"}
+# Spellings/shorthands that all route to the PostgreSQL wrapper, so `wrap postgres`
+# doesn't silently fall through to the generic HTTP wrapper.
+POSTGRES_TARGETS = {"postgresql", "postgres", "postgre", "psql", "pg"}
 HOSTED_API_URL = "https://api.invokehq.run"
 DEFAULT_API_URL = HOSTED_API_URL
 DEFAULT_TIMEOUT_SECONDS = int(os.getenv("INVOKE_TIMEOUT_SECONDS", "90"))
@@ -321,10 +324,22 @@ def infer_sql_params(query: str) -> dict[str, Any]:
     return {"type": "object", "properties": properties, "required": names}
 
 
+# Keywords that mutate data even inside an otherwise read-looking statement — most
+# notably a data-modifying CTE: WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x.
+_SQL_WRITE_KEYWORDS = re.compile(
+    r"\b(insert|update|delete|merge|truncate|drop|alter|create|replace|grant|revoke|call|copy|vacuum)\b"
+)
+
+
 def sql_is_read_only(query: str) -> bool:
-    stripped = re.sub(r"/\*.*?\*/", "", query, flags=re.S).strip()
-    stripped = re.sub(r"--.*?$", "", stripped, flags=re.M).strip()
-    return stripped.lower().startswith(("select", "with"))
+    cleaned = re.sub(r"/\*.*?\*/", " ", query, flags=re.S)
+    cleaned = re.sub(r"--[^\n]*", " ", cleaned)
+    normalized = cleaned.strip().lower()
+    if not normalized.startswith(("select", "with")):
+        return False
+    # Ignore string literals so a filter value like '...deleted...' isn't misread as DML.
+    scan = re.sub(r"'(?:[^']|'')*'", " ", normalized)
+    return _SQL_WRITE_KEYWORDS.search(scan) is None
 
 
 def postgres_tool(args: argparse.Namespace) -> dict[str, Any]:
@@ -720,6 +735,21 @@ def validate_args(tool: dict[str, Any], args: dict[str, Any]) -> list[str]:
     return errors
 
 
+_SQL_WRITE_KEYWORDS = re.compile(
+    r"\b(insert|update|delete|merge|truncate|drop|alter|create|replace|grant|revoke|call|copy|vacuum)\b"
+)
+
+
+def _query_is_read_only(query: str) -> bool:
+    cleaned = re.sub(r"/\*.*?\*/", " ", query, flags=re.S)
+    cleaned = re.sub(r"--[^\n]*", " ", cleaned)
+    normalized = cleaned.strip().lower()
+    if not normalized.startswith(("select", "with")):
+        return False
+    scan = re.sub(r"'(?:[^']|'')*'", " ", normalized)
+    return _SQL_WRITE_KEYWORDS.search(scan) is None
+
+
 async def call_postgresql(tool: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     try:
         import psycopg
@@ -733,8 +763,12 @@ async def call_postgresql(tool: dict[str, Any], args: dict[str, Any]) -> dict[st
         raise RuntimeError(f"Missing {config.get('database_url_env', 'DATABASE_URL')}")
 
     query = config["query"]
-    if config.get("read_only") and not re.sub(r"/\*.*?\*/", "", query, flags=re.S).strip().lower().startswith(("select", "with")):
-        raise RuntimeError("Generated PostgreSQL wrapper refused non-read-only SQL")
+    if config.get("read_only") and not _query_is_read_only(query):
+        raise RuntimeError(
+            "Generated PostgreSQL wrapper refused a non-read-only query. A read-only "
+            "wrapper runs only SELECT/WITH statements with no data-modifying keyword "
+            "(e.g. a WITH ... DELETE CTE). Regenerate with --allow-write to permit writes."
+        )
 
     started = time.perf_counter()
     with psycopg.connect(database_url, row_factory=dict_row) as conn:
@@ -991,7 +1025,7 @@ def write_project(slug: str, tools: list[dict[str, Any]], output: str) -> Path:
 
 
 def build_tools(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
-    if args.target == "postgresql":
+    if slugify(args.target) in POSTGRES_TARGETS:
         return slugify(args.name or "postgresql-query"), [postgres_tool(args)]
     if slugify(args.target) in LAUNCH_CONNECTORS:
         return slugify(args.name or args.target), launch_connector_tools(args.target)

@@ -230,3 +230,28 @@ test("generated wrapper server.py is valid Python (real booleans, not JSON true/
   assert.equal(check.status, 0, check.stderr || check.stdout);
   assert.match(check.stdout, /OK 2 wrapper\(s\) parsed/);
 });
+
+test("wrap postgres shorthand routes to the PostgreSQL wrapper, not generic HTTP", () => {
+  // A bare `wrap postgres` must reach the postgres path (which requires --query),
+  // not silently fall through to the generic HTTP wrapper.
+  const result = spawnSync(process.execPath, [binPath, "wrap", "postgres"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /postgresql wrappers require --query/);
+});
+
+test("wrap refuses a data-modifying CTE as read-only", () => {
+  // WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x starts with WITH but writes;
+  // it must not be classified read-only (requires --allow-write).
+  const result = spawnSync(
+    process.execPath,
+    [binPath, "wrap", "postgresql", "--query",
+      "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x", "--name", "cte"],
+    { cwd: repoRoot, env: isolatedEnv(), encoding: "utf8" }
+  );
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /read-only by default|allow-write/);
+});
