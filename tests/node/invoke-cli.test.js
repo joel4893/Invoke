@@ -255,3 +255,42 @@ test("wrap refuses a data-modifying CTE as read-only", () => {
   assert.equal(result.status, 2);
   assert.match(result.stderr, /read-only by default|allow-write/);
 });
+
+test("gateway --help lists the governed MCP-gateway subcommands", () => {
+  const result = spawnSync(process.execPath, [binPath, "gateway", "--help"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  for (const sub of ["create", "use", "url", "connect", "tools", "call", "status"]) {
+    assert.match(result.stdout, new RegExp(`\\b${sub}\\b`));
+  }
+});
+
+test("gateway call without a tool prints actionable usage", () => {
+  const result = spawnSync(process.execPath, [binPath, "gateway", "call"], {
+    cwd: repoRoot,
+    env: envWithKey(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Missing tool/);
+  assert.match(result.stderr, /invoke gateway call <tool>/);
+});
+
+test("gateway url without an active gateway workspace explains how to select one", () => {
+  // Credentials are present (envWithKey) but no gateway workspace is set, so the
+  // gateway-workspace resolver — not the runtime one — must complain.
+  const result = spawnSync(process.execPath, [binPath, "gateway", "url"], {
+    cwd: repoRoot,
+    env: { ...envWithKey(), INVOKE_GATEWAY_WORKSPACE: "" },
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /No active gateway workspace/);
+  assert.match(result.stderr, /invoke gateway create/);
+});

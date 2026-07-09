@@ -210,6 +210,70 @@ def load_workspace(args: argparse.Namespace) -> str:
     return workspace_id
 
 
+def set_active_gateway_workspace(workspace_id: str) -> None:
+    """Persist the active gateway (effect-ledger) workspace. Kept separate from the
+    runtime `workspace_id` because the hosted MCP gateway lives on `/v1/workspaces/{id}`
+    (ws_* tables), a different id space than the runtime `/v1/runtime/workspaces/{id}`."""
+    store = load_config_store()
+    store["gateway_workspace_id"] = str(workspace_id).strip()
+    save_config_store(store)
+
+
+def stored_gateway_workspace() -> str | None:
+    value = load_config_store().get("gateway_workspace_id")
+    return str(value) if value else None
+
+
+def load_gateway_workspace(args: argparse.Namespace) -> str:
+    """Resolve the active gateway workspace id: --workspace > INVOKE_GATEWAY_WORKSPACE >
+    config. Deliberately does NOT fall back to the runtime workspace or the project pin —
+    a runtime id will 404 against the gateway."""
+    workspace_id = (
+        getattr(args, "workspace", None)
+        or os.getenv("INVOKE_GATEWAY_WORKSPACE")
+        or stored_gateway_workspace()
+    )
+    if not workspace_id:
+        raise CliUsageError(
+            "No active gateway workspace. Run `invoke gateway create <name>` to provision one, "
+            "or pass --workspace <ws_id> (or set INVOKE_GATEWAY_WORKSPACE)."
+        )
+    return workspace_id
+
+
+def gateway_mcp_url(base_url: str, workspace_id: str) -> str:
+    """The single hosted MCP URL an agent points its client at for this workspace."""
+    return f"{base_url.rstrip('/')}/v1/workspaces/{workspace_id}/mcp"
+
+
+def gateway_mcp_rpc_raw(
+    args: argparse.Namespace, method: str, params: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """POST a JSON-RPC message to the workspace MCP endpoint. Returns (envelope, error):
+    the gateway answers HTTP 200 for governance blocks and surfaces them as a JSON-RPC
+    `error` (with `data.decision`), so the caller inspects `error` rather than a status code."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    envelope = api_request(
+        "POST",
+        credentials["base_url"],
+        f"/v1/workspaces/{workspace_id}/mcp",
+        credentials["api_key"],
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+    )
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    return envelope, (error if isinstance(error, dict) else None)
+
+
+def gateway_mcp_rpc(args: argparse.Namespace, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """gateway_mcp_rpc_raw, but raises on a JSON-RPC error and returns just the result."""
+    envelope, error = gateway_mcp_rpc_raw(args, method, params)
+    if error is not None:
+        raise RuntimeError(f"Gateway MCP error: {error.get('message', 'unknown error')}")
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    return result if isinstance(result, dict) else {}
+
+
 def normalize_config_key(key: str) -> str:
     aliases = {
         "base-url": "base_url",
@@ -266,6 +330,18 @@ def api_request(method: str, base_url: str, path: str, api_key: str, body: dict[
                 "Run `invoke login --api-key <your_key>` or set INVOKE_API_KEY."
             ) from exc
         if exc.code == 404:
+            # An application 404 carries a JSON {"detail": ...} with the real reason
+            # (an unregistered gateway tool, an unknown workspace) — surface that. A bare
+            # or HTML 404 means the route itself is missing: the CLI is on an old runtime.
+            reason = ""
+            try:
+                parsed = json.loads(detail)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("detail"):
+                reason = str(parsed["detail"])
+            if reason:
+                raise RuntimeError(f"{method} {url} failed with 404: {reason}") from exc
             raise RuntimeError(
                 f"{method} {url} failed with 404: endpoint not found.\n"
                 "Your CLI may be pointed at an old runtime. "
@@ -2353,6 +2429,7 @@ COMMAND_LAYERS: dict[str, tuple[str, str]] = {
     "wrap": ("Execution", "Generate a tool wrapper project"),
     "dev": ("Execution", "Run a local MCP server for this project"),
     "tools": ("Execution", "List available tools"),
+    "gateway": ("Execution", "Point at and drive the hosted MCP gateway (governed tool calls)"),
     "status": ("Observability", "Runtime health and workspace dashboard"),
     "logs": ("Observability", "Show or follow the execution event log"),
     "doctor": ("Observability", "Diagnose credentials and runtime health"),
@@ -2395,6 +2472,149 @@ def layers_command(args: argparse.Namespace) -> int:
         if cmds:
             print(f"   commands: {', '.join(cmd for cmd, _ in cmds)}")
         print()
+    return 0
+
+
+def gateway_create_command(args: argparse.Namespace) -> int:
+    credentials = require_credentials(args)
+    body: dict[str, Any] = {"name": args.name}
+    if getattr(args, "budget_micros", None) is not None:
+        body["budget_micros"] = args.budget_micros
+    response = api_request(
+        "POST", credentials["base_url"], "/v1/workspaces", credentials["api_key"], body
+    )
+    workspace = response.get("workspace") if isinstance(response, dict) else None
+    if not isinstance(workspace, dict) or not workspace.get("id"):
+        raise RuntimeError("Gateway did not return a workspace id.")
+    workspace_id = str(workspace["id"])
+    set_active_gateway_workspace(workspace_id)
+    if getattr(args, "json", False):
+        print(json.dumps(response, indent=2))
+        return 0
+    print(f"Created gateway workspace {workspace.get('name', args.name)} ({workspace_id})")
+    print(f"MCP URL: {gateway_mcp_url(credentials['base_url'], workspace_id)}")
+    print("Point an agent's MCP client at that URL, or run "
+          "`invoke gateway connect <name> <mcp_url>` to import tools.")
+    return 0
+
+
+def gateway_use_command(args: argparse.Namespace) -> int:
+    workspace_id = args.workspace_id.strip()
+    if not workspace_id:
+        raise CliUsageError("Provide a workspace id: `invoke gateway use <id>`.")
+    set_active_gateway_workspace(workspace_id)
+    print(f"Active gateway workspace set to {workspace_id}.")
+    return 0
+
+
+def gateway_url_command(args: argparse.Namespace) -> int:
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    url = gateway_mcp_url(credentials["base_url"], workspace_id)
+    if getattr(args, "json", False):
+        print(json.dumps({"workspace_id": workspace_id, "mcp_url": url}, indent=2))
+        return 0
+    # URL alone on stdout so `$(invoke gateway url)` stays clean; guidance to stderr.
+    print(url)
+    print("Paste this into Claude/Cursor/ChatGPT as an MCP server URL; every tool call "
+          "then routes through the gateway (dedup, blocking, shared context, receipts).",
+          file=sys.stderr)
+    return 0
+
+
+def gateway_connect_command(args: argparse.Namespace) -> int:
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    if bool(args.auth_header) != bool(args.auth_value):
+        raise CliUsageError("Provide both --auth-header and --auth-value, or neither.")
+    body: dict[str, Any] = {"name": args.name, "mcp_url": args.mcp_url}
+    if args.auth_header and args.auth_value:
+        body["auth"] = {"header": args.auth_header, "value": args.auth_value}
+    response = api_request(
+        "POST",
+        credentials["base_url"],
+        f"/v1/workspaces/{workspace_id}/connectors",
+        credentials["api_key"],
+        body,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(response, indent=2))
+        return 0
+    connector = response.get("connector", {}) if isinstance(response, dict) else {}
+    tool_count = connector.get("tools_count", "?")
+    print(f"Connected {connector.get('name', args.name)} ({connector.get('id', '-')}) — "
+          f"{tool_count} tools imported and now governed.")
+    print("See them with `invoke gateway tools`, or route one through the ledger with "
+          "`invoke gateway call <tool> '<json>'`.")
+    return 0
+
+
+def gateway_tools_command(args: argparse.Namespace) -> int:
+    result = gateway_mcp_rpc(args, "tools/list", {})
+    tools = result.get("tools") if isinstance(result.get("tools"), list) else []
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0
+    if not tools:
+        print("No tools connected to this gateway workspace yet.")
+        print("Import an upstream MCP server: `invoke gateway connect <name> <mcp_url>`.")
+        return 0
+    print("TOOL\tDESCRIPTION")
+    for tool in tools:
+        name = tool.get("name") or "-"
+        description = str(tool.get("description") or "").replace("\n", " ")
+        print(f"{name}\t{description}")
+    return 0
+
+
+def gateway_call_command(args: argparse.Namespace) -> int:
+    if not args.tool:
+        raise CliUsageError(
+            "Missing tool.\n"
+            "Usage: invoke gateway call <tool> '<json_params>'\n"
+            "Example: invoke gateway call linear.create_issue '{\"title\":\"Fix retry\"}'"
+        )
+    try:
+        arguments = json.loads(args.params)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"params must be valid JSON: {exc}") from exc
+    if not isinstance(arguments, dict):
+        raise CliUsageError("params must be a JSON object.")
+    # The gateway reads _agent_id / _idempotency_key out of the MCP call arguments.
+    arguments = dict(arguments)
+    arguments["_agent_id"] = args.agent_id
+    if args.idempotency_key:
+        arguments["_idempotency_key"] = args.idempotency_key
+    envelope, error = gateway_mcp_rpc_raw(
+        args, "tools/call", {"name": args.tool, "arguments": arguments}
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(envelope, indent=2))
+        return 0 if error is None else 1
+    if error is not None:
+        # Governance blocked/paused/failed the call — surface the decision, not a raw trace.
+        decision = (error.get("data") or {}).get("decision") if isinstance(error.get("data"), dict) else None
+        label = f" [{decision}]" if decision else ""
+        print(f"Gateway blocked the call{label}: {error.get('message', 'blocked')}")
+        return 1
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    print(json.dumps(result if result is not None else {}, indent=2))
+    return 0
+
+
+def gateway_status_command(args: argparse.Namespace) -> int:
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    response = api_request(
+        "GET", credentials["base_url"], f"/v1/workspaces/{workspace_id}/mcp", credentials["api_key"]
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(response, indent=2))
+        return 0
+    print(f"Gateway workspace: {workspace_id}")
+    print(f"MCP URL: {gateway_mcp_url(credentials['base_url'], workspace_id)}")
+    print(f"Transport: {response.get('transport', '-')}")
+    print(f"Tools available: {response.get('tools_available', 0)}")
     return 0
 
 
@@ -2557,6 +2777,78 @@ def build_parser() -> argparse.ArgumentParser:
     wrap.add_argument("--description", help="Capability description.")
     wrap.add_argument("--output", default="wrapped_tools", help="Output directory.")
     wrap.set_defaults(func=wrap_command)
+
+    gateway = subparsers.add_parser(
+        "gateway", help="Point at and drive the hosted MCP gateway (governed tool calls)."
+    )
+    gateway_subparsers = gateway.add_subparsers(dest="gateway_action", required=True)
+
+    gw_create = gateway_subparsers.add_parser(
+        "create", help="Provision a gateway (effect-ledger) workspace and make it active."
+    )
+    gw_create.add_argument("name", help="Workspace name.")
+    gw_create.add_argument("--budget-micros", type=int, help="Initial workspace budget in micros.")
+    gw_create.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_create.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_create.add_argument("--api-key", help="Override Invoke API key.")
+    gw_create.set_defaults(func=gateway_create_command)
+
+    gw_use = gateway_subparsers.add_parser("use", help="Set the active gateway workspace.")
+    gw_use.add_argument("workspace_id", help="Gateway workspace id to activate.")
+    gw_use.set_defaults(func=gateway_use_command)
+
+    gw_url = gateway_subparsers.add_parser(
+        "url", help="Print the hosted MCP URL to paste into Claude/Cursor/ChatGPT."
+    )
+    gw_url.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_url.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_url.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_url.add_argument("--api-key", help="Override Invoke API key.")
+    gw_url.set_defaults(func=gateway_url_command)
+
+    gw_connect = gateway_subparsers.add_parser(
+        "connect", help="Connect an upstream MCP server; its tools become governed."
+    )
+    gw_connect.add_argument("name", help="Connector name, for example 'Linear'.")
+    gw_connect.add_argument("mcp_url", help="Upstream MCP server URL (http/https).")
+    gw_connect.add_argument("--auth-header", help="Auth header name to forward upstream.")
+    gw_connect.add_argument("--auth-value", help="Auth header value to forward upstream.")
+    gw_connect.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_connect.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_connect.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_connect.add_argument("--api-key", help="Override Invoke API key.")
+    gw_connect.set_defaults(func=gateway_connect_command)
+
+    gw_tools = gateway_subparsers.add_parser(
+        "tools", help="List tools exposed by the gateway (governed)."
+    )
+    gw_tools.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_tools.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_tools.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_tools.add_argument("--api-key", help="Override Invoke API key.")
+    gw_tools.set_defaults(func=gateway_tools_command)
+
+    gw_call = gateway_subparsers.add_parser(
+        "call", help="Call a tool THROUGH the gateway (dedup, blocking, context, receipts)."
+    )
+    gw_call.add_argument("tool", nargs="?", help="Tool name, for example linear.create_issue.")
+    gw_call.add_argument("params", nargs="?", default="{}", help="JSON params object.")
+    gw_call.add_argument("--agent-id", default="cli_agent")
+    gw_call.add_argument("--idempotency-key")
+    gw_call.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_call.add_argument("--json", action="store_true", help="Print the full JSON-RPC envelope.")
+    gw_call.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_call.add_argument("--api-key", help="Override Invoke API key.")
+    gw_call.set_defaults(func=gateway_call_command)
+
+    gw_status = gateway_subparsers.add_parser(
+        "status", help="Show the active gateway workspace and its tool count."
+    )
+    gw_status.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_status.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_status.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_status.add_argument("--api-key", help="Override Invoke API key.")
+    gw_status.set_defaults(func=gateway_status_command)
 
     layers = subparsers.add_parser("layers", help="Explain the five Invoke layers.")
     layers.add_argument("--json", action="store_true", help="Print the layer model as JSON.")
