@@ -194,3 +194,64 @@ test("logs without a workspace explains how to provision one", () => {
   assert.equal(result.status, 2);
   assert.match(result.stderr, /No Invoke workspace selected/);
 });
+
+test("generated wrapper server.py is valid Python (real booleans, not JSON true/false)", () => {
+  // Regression guard: server_template() once embedded json.dumps() output, so the
+  // generated TOOLS table held bare true/false/null and every server.py raised
+  // NameError on import. py_compile passed (valid syntax) and missed it, so this
+  // parses the TOOLS literal with ast.literal_eval — which rejects true/false/null
+  // but accepts True/False/None — without needing fastapi/httpx installed.
+  const output = fs.mkdtempSync(path.join(os.tmpdir(), "invoke-wrap-py-"));
+  for (const args of [
+    ["wrap", "postgresql", "--query", "SELECT 1", "--name", "probe", "--output", output],
+    ["wrap", "github", "--output", output],
+  ]) {
+    const gen = spawnSync(process.execPath, [binPath, ...args], { cwd: repoRoot, encoding: "utf8" });
+    assert.equal(gen.status, 0, gen.stderr);
+  }
+
+  const assertScript = [
+    "import ast, glob, os, sys",
+    "files = glob.glob(os.path.join(sys.argv[1], '**', 'server.py'), recursive=True)",
+    "assert files, 'no server.py generated'",
+    "for f in files:",
+    "    src = open(f, encoding='utf-8').read()",
+    "    block = src.split('TOOLS = ', 1)[1].split(chr(10) + 'app = FastAPI', 1)[0].strip()",
+    "    tools = ast.literal_eval(block)  # true/false/null -> ValueError here",
+    "    assert isinstance(tools, dict) and tools, f'empty TOOLS in {f}'",
+    "    assert 'True' in repr(tools) or 'False' in repr(tools), f'no python bool in {f}'",
+    "print('OK', len(files), 'wrapper(s) parsed')",
+  ].join("\n");
+  const scriptPath = path.join(output, "_assert_tools.py");
+  fs.writeFileSync(scriptPath, assertScript);
+
+  const python = process.env.INVOKE_PYTHON || (process.platform === "win32" ? "python" : "python3");
+  const check = spawnSync(python, [scriptPath, output], { encoding: "utf8" });
+  assert.equal(check.status, 0, check.stderr || check.stdout);
+  assert.match(check.stdout, /OK 2 wrapper\(s\) parsed/);
+});
+
+test("wrap postgres shorthand routes to the PostgreSQL wrapper, not generic HTTP", () => {
+  // A bare `wrap postgres` must reach the postgres path (which requires --query),
+  // not silently fall through to the generic HTTP wrapper.
+  const result = spawnSync(process.execPath, [binPath, "wrap", "postgres"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /postgresql wrappers require --query/);
+});
+
+test("wrap refuses a data-modifying CTE as read-only", () => {
+  // WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x starts with WITH but writes;
+  // it must not be classified read-only (requires --allow-write).
+  const result = spawnSync(
+    process.execPath,
+    [binPath, "wrap", "postgresql", "--query",
+      "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x", "--name", "cte"],
+    { cwd: repoRoot, env: isolatedEnv(), encoding: "utf8" }
+  );
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /read-only by default|allow-write/);
+});
