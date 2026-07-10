@@ -1,6 +1,6 @@
 {
   "name": "@invokehq/cli",
-  "version": "0.2.25",
+  "version": "0.3.0",
   "description": "CLI for Invoke, execution reliability infrastructure for AI agents.",
   "license": "Apache-2.0",
   "repository": {
