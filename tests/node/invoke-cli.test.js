@@ -134,7 +134,7 @@ function envWithKey() {
   return { ...isolatedEnv(), INVOKE_API_KEY: "inv_test_offline_key", INVOKE_WORKSPACE: "" };
 }
 
-test("top-level help groups commands by the five layers", () => {
+test("top-level help leads with the builder path, then groups by layer", () => {
   const result = spawnSync(process.execPath, [binPath, "--help"], {
     cwd: repoRoot,
     env: isolatedEnv(),
@@ -142,9 +142,94 @@ test("top-level help groups commands by the five layers", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /commands, by layer:/);
-  for (const layer of ["Identity", "Context", "Coordination", "Execution", "Observability"]) {
+  // The builder path is the headline: eight commands in install -> prove order.
+  const path = result.stdout.indexOf("the builder path");
+  const byLayer = result.stdout.indexOf("commands, by layer:");
+  assert.ok(path >= 0 && byLayer > path, "builder path should precede the layer grouping");
+  for (const cmd of ["login", "init", "deploy", "run", "inspect", "receipts", "graph", "replay"]) {
+    assert.match(result.stdout, new RegExp(`\\b${cmd}\\b`));
+  }
+  // Layers with commands are shown; Context/Coordination are runtime-only now.
+  for (const layer of ["Identity", "Execution", "Observability"]) {
     assert.match(result.stdout, new RegExp(`${layer} —`));
+  }
+  // The deprecated tier collapses to one line and points at the web console.
+  assert.match(result.stdout, /deprecated \(still work/);
+  assert.match(result.stdout, /invokehq\.run\/dashboard/);
+});
+
+test("deprecated commands are hidden from the command list but still parse", () => {
+  const result = spawnSync(process.execPath, [binPath, "--help"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const listing = result.stdout.split("the builder path")[0];
+  // e.g. "    approvals   List..." must NOT appear in the argparse command list.
+  for (const cmd of ["approvals", "preflight", "execute", "workflow"]) {
+    assert.doesNotMatch(listing, new RegExp(`\\n\\s+${cmd}\\s`));
+  }
+});
+
+test("a deprecated command prints where it moved, then still runs", () => {
+  // `call` (no tool) fails at its own usage check before any network, so we see both
+  // the demotion note and the original handler running — proof it is demoted, not removed.
+  const result = spawnSync(process.execPath, [binPath, "call"], {
+    cwd: repoRoot,
+    env: envWithKey(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /note: call one tool through the governed gateway/);
+  assert.match(result.stderr, /Missing tool/);
+});
+
+test("the four builder-path commands are registered and parse", () => {
+  for (const cmd of ["inspect", "receipts", "graph", "replay"]) {
+    const result = spawnSync(process.execPath, [binPath, cmd, "--help"], {
+      cwd: repoRoot,
+      env: isolatedEnv(),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, `${cmd} --help failed: ${result.stderr}`);
+    assert.match(result.stdout, new RegExp(`usage: invoke ${cmd}`));
+  }
+});
+
+test("receipts --verify exposes the ledger/receipt verification flag", () => {
+  const result = spawnSync(process.execPath, [binPath, "receipts", "--help"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /--verify/);
+});
+
+test("trace and watch alias onto inspect and logs", () => {
+  // trace -> inspect, watch -> logs; both resolve a workspace, so with a key but no
+  // workspace they hit the same "select a workspace" error as their targets.
+  for (const alias of ["trace", "watch"]) {
+    const result = spawnSync(process.execPath, [binPath, alias], {
+      cwd: repoRoot,
+      env: envWithKey(),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 2, `${alias} should reach its target handler`);
+    assert.match(result.stderr, /No Invoke workspace selected/);
+  }
+});
+
+test("layers command includes the new builder-path commands", () => {
+  const result = spawnSync(process.execPath, [binPath, "layers"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  for (const cmd of ["inspect", "receipts", "graph", "replay"]) {
+    assert.match(result.stdout, new RegExp(`\\b${cmd}\\b`));
   }
 });
 

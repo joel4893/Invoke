@@ -35,9 +35,31 @@ invoke dev install
 # 5. Register its tools with Invoke
 invoke deploy
 
-# 6. Call a tool through the execution layer
-invoke call crm_update_customer '{"customer_id":"cust_123","account_status":"review"}'
+# 6. Run it, then prove what happened
+invoke run support-agent
+invoke inspect            # the last run: pipeline, cost, and its exact ledger slice
+invoke receipts           # a signed receipt for every run
+invoke receipts --verify  # re-verify the whole ledger — tamper-evident
 ```
+
+## The builder path
+
+Eight commands take you from install to a proven, replayable run — the whole
+developer surface:
+
+```bash
+invoke login     # authenticate to your runtime
+invoke init      # scaffold a project + provision a workspace
+invoke deploy    # register its runtime, policies, agents, tools
+invoke run       # run an agent or a workflow file
+invoke inspect   # a run's full story: pipeline, cost, and its ledger slice
+invoke receipts  # list / show / cryptographically verify signed receipts
+invoke graph     # the workspace agent graph: agents, tasks, recent runs
+invoke replay    # re-run an execution with the same tool, params, and intent
+```
+
+Everything collaborative — approvals, policies, organizations, billing — lives in the
+web console at [invokehq.run/dashboard](https://invokehq.run/dashboard).
 
 ## Commands, by layer
 
@@ -47,13 +69,18 @@ Invoke is one system with five layers, and every command maps to one. Run
 | Layer | What it governs | Commands |
 | --- | --- | --- |
 | **Identity** | who each agent is, what it may do, what it may spend | `login` / `auth`, `config`, `agents` |
-| **Context** | one governed source of truth every agent shares, with provenance | `search` |
-| **Coordination** | agent-to-agent handoffs as a first-class, durable primitive | `workflow` |
-| **Execution** | every action governed like a transaction: exactly-once, authorized, reconciled, approved if risky, receipted | `init`, `deploy`, `run`, `call`, `execute`, `preflight`, `approvals`, `wrap`, `dev`, `tools` |
-| **Observability** | who did what, why, at what cost, and where the bottlenecks are | `status`, `logs`, `doctor`, `layers` |
+| **Context** | one governed source of truth every agent shares, with provenance | (runtime API) |
+| **Coordination** | agent-to-agent handoffs as a first-class, durable primitive | (runtime API) |
+| **Execution** | every action governed like a transaction: exactly-once, authorized, reconciled, approved if risky, receipted | `init`, `deploy`, `run`, `replay`, `receipts`, `wrap`, `dev`, `gateway` |
+| **Observability** | who did what, why, at what cost, and where the bottlenecks are | `status`, `logs`, `inspect`, `graph`, `doctor`, `layers` |
 
 `invoke init <name>` provisions a runtime workspace and pins it locally; `invoke status`
 and `invoke logs` then read that workspace, and `invoke run <agent>` starts work in it.
+
+A handful of earlier commands — `tools`, `call`, `search`, `preflight`, `execute`,
+`workflow`, `approvals` — still work but are deprecated: each prints where the
+capability moved (governed tool calls to `invoke gateway call`; approvals to the web
+console). `trace` and `watch` alias to `inspect` and `logs`.
 
 Then call tools through one execution layer:
 
@@ -984,7 +1011,7 @@ The demo starts the flaky MCP simulator, a mock tool/CRM MCP server, the Invoke 
 
 - API-key authentication
 - scoped API tokens with tool allowlists and read-only checks
-- npm/npx CLI package with `invoke login`, `invoke init`, `invoke deploy`, `invoke call`, `invoke agents list`, and `invoke wrap`
+- npm/npx CLI package with the builder path — `invoke login`, `invoke init`, `invoke deploy`, `invoke run`, `invoke inspect`, `invoke receipts`, `invoke graph`, `invoke replay` — plus `invoke agents list` and `invoke wrap`
 - `invoke wrap` generator for OpenAPI, GitHub, Notion, Linear, and PostgreSQL MCP wrappers
 - hosted gateway URL metadata for connected SaaS tools
 - agent-readable tool registry
