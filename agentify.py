@@ -1409,6 +1409,261 @@ def run_command(args: argparse.Namespace) -> int:
     return watch_task(creds, workspace_id, task_id)
 
 
+# ───────────────────────── time travel over the execution ledger ─────────────────────────
+#
+# inspect / receipts / graph / replay read the runtime executions API
+# (/v1/runtime/workspaces/{id}/executions…, /receipts, /agents, /tasks). Every Invoke
+# run is already an immutable ledger slice, so an execution id is enough to tell its
+# whole story, prove it with a signed receipt, or re-run it.
+
+
+def resolve_execution_ref(creds: dict[str, str], workspace_id: str, ref: str | None) -> str:
+    """An execution ref is an id, or `last` for the workspace's most recent run."""
+    ref = (ref or "last").strip()
+    if ref != "last":
+        return ref
+    response = runtime_request("GET", creds, workspace_id, "/executions?limit=1")
+    executions = response.get("executions") or []
+    if not executions:
+        raise CliUsageError("No executions in this workspace yet. Run `invoke run <agent>` first.")
+    return str(executions[0]["id"])
+
+
+def stage_glyph(status: Any) -> str:
+    s = str(status or "").lower()
+    if s in {"ok", "allow", "completed", "approved", "issued", "succeeded"}:
+        return "✓"
+    if s in {"failed", "deny", "denied", "exceeded", "error"}:
+        return "✗"
+    if s == "skipped":
+        return "–"
+    return "…"
+
+
+def print_execution_summary(execution: dict[str, Any], receipt: dict[str, Any] | None = None) -> None:
+    pipeline = execution.get("pipeline") or []
+    if pipeline:
+        print("Pipeline: " + " → ".join(
+            f"{stage.get('stage')} {stage_glyph(stage.get('status'))}" for stage in pipeline))
+    print(f"Status: {execution.get('status', '-')}")
+    if execution.get("decision_reason"):
+        print(f"Policy: {execution.get('decision_source') or '-'} — {execution['decision_reason']}")
+    cost = execution.get("cost") or {}
+    actual = cost.get("actual_micros")
+    label = fmt_cost(actual if actual is not None else cost.get("estimated_micros"))
+    print(f"Cost: {label}{'' if actual is not None else ' (estimated)'}")
+    if execution.get("latency_ms") is not None:
+        print(f"Latency: {execution['latency_ms']} ms")
+    if execution.get("error"):
+        print(f"Error: {execution['error']}")
+    if receipt and receipt.get("receipt_id"):
+        print(f"Receipt: {receipt['receipt_id']}")
+
+
+def inspect_command(args: argparse.Namespace) -> int:
+    creds = require_credentials(args)
+    workspace_id = load_workspace(args)
+    exec_id = resolve_execution_ref(creds, workspace_id, args.execution_id)
+    detail = runtime_request("GET", creds, workspace_id, f"/executions/{exec_id}")
+    events = runtime_request("GET", creds, workspace_id, f"/executions/{exec_id}/events")
+    if args.json:
+        print(json.dumps({"execution": detail.get("execution"), "receipt": detail.get("receipt"),
+                          "events": events.get("events")}, indent=2))
+        return 0
+    execution = detail.get("execution") or {}
+    action = execution.get("action")
+    print(f"Execution {exec_id} — {execution.get('tool')}"
+          + (f" · {action}" if action and action != "invoke" else ""))
+    if execution.get("intent"):
+        print(f"Intent: {execution['intent']}")
+    print(f"Agent: {execution.get('agent_id')}    Requested: {execution.get('requested_at')}")
+    print_execution_summary(execution, detail.get("receipt"))
+    event_list = events.get("events") or []
+    print()
+    print(f"Ledger slice ({events.get('count', len(event_list))} events):")
+    print_events(event_list)
+    print()
+    print(f"Re-run it:  invoke replay {exec_id}")
+    return 0
+
+
+def replay_command(args: argparse.Namespace) -> int:
+    creds = require_credentials(args)
+    workspace_id = load_workspace(args)
+    exec_id = resolve_execution_ref(creds, workspace_id, args.execution_id)
+    body: dict[str, Any] = {}
+    if getattr(args, "agent_id", None):
+        body["agent_id"] = args.agent_id
+    response = runtime_request("POST", creds, workspace_id, f"/executions/{exec_id}/replay", body)
+    if args.json:
+        print(json.dumps(response, indent=2))
+        return 0
+    execution = response.get("execution") or {}
+    new_id = execution.get("id", "-")
+    print(f"Replayed {exec_id} → {new_id}")
+    print_execution_summary(execution, response.get("receipt"))
+    approval = response.get("approval")
+    if approval:
+        print(f"Awaiting approval: {approval.get('id')} — {approval.get('summary') or ''}")
+    verdict = (response.get("diff") or {}).get("verdict") or []
+    if verdict:
+        print()
+        print(f"vs {exec_id}:")
+        for line in verdict:
+            print(f"  · {line}")
+    print()
+    print(f"Inspect it:  invoke inspect {new_id}")
+    return 0
+
+
+def receipts_command(args: argparse.Namespace) -> int:
+    creds = require_credentials(args)
+    workspace_id = load_workspace(args)
+    receipt_id = getattr(args, "receipt_id", None)
+    if receipt_id and args.verify:
+        response = runtime_request("GET", creds, workspace_id, f"/receipts/{receipt_id}/verify")
+        if args.json:
+            print(json.dumps(response, indent=2))
+            return 0
+        verification = response.get("verification") or {}
+        valid = bool(verification.get("valid"))
+        print(f"Receipt {receipt_id}: {'valid' if valid else 'INVALID'}")
+        for check in verification.get("checks") or []:
+            print(f"  {'✓' if check.get('passed') else '✗'} {check.get('check')}")
+        return 0 if valid else 1
+    if receipt_id:
+        response = runtime_request("GET", creds, workspace_id, f"/receipts/{receipt_id}")
+        if args.json:
+            print(json.dumps(response, indent=2))
+            return 0
+        receipt = response.get("receipt") or {}
+        agent = receipt.get("agent") or {}
+        action = receipt.get("action")
+        print(f"Receipt {receipt.get('receipt_id')} — {receipt.get('tool')}"
+              + (f" · {action}" if action and action != "invoke" else ""))
+        print(f"Execution: {receipt.get('execution_id')}    Agent: {agent.get('id')}")
+        print(f"Status: {receipt.get('status')}    Issued: {receipt.get('issued_at')}")
+        policy = receipt.get("policy") or {}
+        if policy.get("source"):
+            reason = f" — {policy['reason']}" if policy.get("reason") else ""
+            print(f"Policy: {policy.get('source')}{reason} (risk: {policy.get('risk')})")
+        cost = receipt.get("cost") or {}
+        if cost.get("actual_micros") is not None:
+            print(f"Cost: {fmt_cost(cost['actual_micros'])}")
+        print(f"Hash: {receipt.get('receipt_hash')}")
+        print(f"Chained to: {receipt.get('prev_receipt_hash')}")
+        print()
+        print(f"Prove it:  invoke receipts {receipt.get('receipt_id')} --verify")
+        return 0
+    if args.verify:
+        response = runtime_request("GET", creds, workspace_id, "/ledger/verify")
+        if args.json:
+            print(json.dumps(response, indent=2))
+            return 0
+        ledger = response.get("ledger") or {}
+        if ledger.get("valid"):
+            print(f"Ledger valid — {ledger.get('events', 0)} events, head {ledger.get('head_hash')}")
+            return 0
+        print(f"Ledger INVALID — broken at seq {ledger.get('broken_at_seq')}: {ledger.get('reason')}")
+        return 1
+    query = f"/receipts?limit={args.limit}"
+    for flag, param in (("tool", "tool"), ("agent_id", "agent_id"), ("status", "status")):
+        value = getattr(args, flag, None)
+        if value:
+            query += f"&{param}={urllib.parse.quote(value)}"
+    response = runtime_request("GET", creds, workspace_id, query)
+    if args.json:
+        print(json.dumps(response, indent=2))
+        return 0
+    receipts = response.get("receipts") or []
+    if not receipts:
+        print("No receipts yet. Every terminal run mints one — try `invoke run <agent>`.")
+        return 0
+    print("RECEIPT\tEXECUTION\tTOOL\tSTATUS\tCOST\tISSUED")
+    for receipt in receipts:
+        cost = (receipt.get("cost") or {}).get("actual_micros")
+        print(
+            f"{receipt.get('receipt_id') or '-'}\t"
+            f"{receipt.get('execution_id') or '-'}\t"
+            f"{receipt.get('tool') or '-'}\t"
+            f"{receipt.get('status') or '-'}\t"
+            f"{fmt_cost(cost)}\t"
+            f"{receipt.get('issued_at') or '-'}"
+        )
+    print()
+    print("Prove one:  invoke receipts <receipt_id> --verify   ·   whole ledger:  invoke receipts --verify")
+    return 0
+
+
+def liveness_glyph(liveness: Any) -> str:
+    return {"live": "●", "idle": "○", "retired": "·"}.get(str(liveness or ""), "○")
+
+
+def graph_command(args: argparse.Namespace) -> int:
+    """Fold the workspace into a terminal agent graph: each agent with its tasks
+    and recent runs — the same picture as the web console's Agent Graph."""
+    creds = require_credentials(args)
+    workspace_id = load_workspace(args)
+    agents = runtime_request("GET", creds, workspace_id, "/agents").get("agents") or []
+    tasks = runtime_request("GET", creds, workspace_id, "/tasks").get("tasks") or []
+    executions = runtime_request(
+        "GET", creds, workspace_id, f"/executions?limit={args.limit}").get("executions") or []
+    if args.json:
+        print(json.dumps({"workspace_id": workspace_id, "agents": agents,
+                          "tasks": tasks, "executions": executions}, indent=2))
+        return 0
+
+    tasks_by_agent: dict[str, list[dict[str, Any]]] = {}
+    unassigned_tasks: list[dict[str, Any]] = []
+    for task in tasks:
+        owner = task.get("owner_agent_id")
+        if owner:
+            tasks_by_agent.setdefault(str(owner), []).append(task)
+        else:
+            unassigned_tasks.append(task)
+    execs_by_agent: dict[str, list[dict[str, Any]]] = {}
+    for execution in executions:
+        execs_by_agent.setdefault(str(execution.get("agent_id")), []).append(execution)
+
+    live = sum(1 for a in agents if a.get("liveness") == "live")
+    print(f"Workspace {workspace_id} — {len(agents)} agents ({live} live) · "
+          f"{len(tasks)} tasks · {len(executions)} recent runs")
+    if not agents and not executions:
+        print()
+        print("Nothing here yet. Deploy an agent (`invoke deploy`) or run one (`invoke run <agent>`).")
+        return 0
+    known_agents = {str(a.get("id")) for a in agents}
+    ghost_ids = [aid for aid in execs_by_agent if aid not in known_agents]
+    nodes = [(a.get("id"), a) for a in agents] + [(aid, None) for aid in ghost_ids]
+    for agent_id, agent in nodes:
+        print()
+        if agent:
+            name = agent.get("name") or agent_id
+            detail = f" — {agent.get('kind')}" if agent.get("kind") else ""
+            print(f"{liveness_glyph(agent.get('liveness'))} {name} ({agent_id}){detail}")
+        else:
+            print(f"○ {agent_id} (unregistered)")
+        rows: list[str] = []
+        for task in tasks_by_agent.get(str(agent_id), []):
+            rows.append(f"task {task.get('id')}  {task.get('status')}  “{task.get('title')}”")
+        for execution in execs_by_agent.get(str(agent_id), [])[: args.runs]:
+            cost = (execution.get("cost") or {}).get("actual_micros")
+            rows.append(
+                f"{stage_glyph(execution.get('status'))} {execution.get('id')}  "
+                f"{execution.get('tool')}  {execution.get('status')}  {fmt_cost(cost)}"
+            )
+        for i, row in enumerate(rows):
+            print(f"  {'└─' if i == len(rows) - 1 else '├─'} {row}")
+    if unassigned_tasks:
+        print()
+        print("Unassigned tasks:")
+        for task in unassigned_tasks:
+            print(f"  · {task.get('id')}  {task.get('status')}  “{task.get('title')}”")
+    print()
+    print("The live picture — graph, approvals, timeline — is in the web console: https://invokehq.run/dashboard")
+    return 0
+
+
 def doctor_command(args: argparse.Namespace) -> int:
     credentials = load_credentials()
     base_url = args.base_url or credentials["base_url"]
@@ -2412,28 +2667,46 @@ LAYERS: list[tuple[str, str]] = [
 ]
 
 # command -> (layer, one-line summary), used for the layered help view and `invoke layers`.
+# Deprecated commands are intentionally absent here (see DEPRECATED_COMMANDS) so they
+# stay out of the layer model and `invoke layers`.
 COMMAND_LAYERS: dict[str, tuple[str, str]] = {
     "login": ("Identity", "Authenticate and save runtime credentials"),
     "auth": ("Identity", "Authenticate (alias for login)"),
     "config": ("Identity", "Show or update CLI config"),
     "agents": ("Identity", "List agents / projects deployed from this machine"),
-    "search": ("Context", "Search live docs/context through Invoke"),
-    "workflow": ("Coordination", "Run a packaged multi-step workflow"),
     "init": ("Execution", "Scaffold a project and provision a workspace"),
     "deploy": ("Execution", "Deploy runtime, policies, agents, tools"),
     "run": ("Execution", "Run an agent or a workflow file"),
-    "call": ("Execution", "Call a tool through Invoke"),
-    "execute": ("Execution", "Execute an action through the control boundary"),
-    "preflight": ("Execution", "Simulate an action before execution"),
-    "approvals": ("Execution", "List or resolve pending approvals"),
+    "replay": ("Execution", "Re-run an execution with the same tool, params, and intent"),
+    "receipts": ("Execution", "List, show, and cryptographically verify signed run receipts"),
     "wrap": ("Execution", "Generate a tool wrapper project"),
     "dev": ("Execution", "Run a local MCP server for this project"),
-    "tools": ("Execution", "List available tools"),
     "gateway": ("Execution", "Point at and drive the hosted MCP gateway (governed tool calls)"),
     "status": ("Observability", "Runtime health and workspace dashboard"),
     "logs": ("Observability", "Show or follow the execution event log"),
+    "inspect": ("Observability", "Show a run's full story: pipeline, cost, and its ledger slice"),
+    "graph": ("Observability", "Render the workspace agent graph: agents, tasks, and recent runs"),
     "doctor": ("Observability", "Diagnose credentials and runtime health"),
     "layers": ("Observability", "Explain the five Invoke layers"),
+}
+
+# The developer product in eight commands: what an AI engineer types between
+# `npm install -g @invokehq/cli` and a proven, replayable run. Everything
+# collaborative (approvals, policies, org, billing) lives in the web console.
+BUILDER_PATH: list[str] = [
+    "login", "init", "deploy", "run", "inspect", "receipts", "graph", "replay",
+]
+
+# Legacy commands: still registered and functional, but hidden from the layer
+# help and stamped with a pointer to where the capability lives now.
+DEPRECATED_COMMANDS: dict[str, str] = {
+    "tools": "tool discovery moved behind the gateway — use `invoke gateway tools`.",
+    "call": "call one tool through the governed gateway — use `invoke gateway call`.",
+    "search": "legacy demo command — live context is moving into the workspace context API.",
+    "preflight": "preflight is now a pipeline stage — `invoke run` simulates policy before executing.",
+    "execute": "superseded — run an agent/workflow with `invoke run`, or one tool with `invoke gateway call`.",
+    "workflow": "legacy demo command — packaged workflows are moving to the web console.",
+    "approvals": "approvals are a team surface — review them in the web console: https://invokehq.run/dashboard",
 }
 
 
@@ -2442,13 +2715,29 @@ def commands_for_layer(layer: str) -> list[tuple[str, str]]:
 
 
 def layered_epilog() -> str:
-    lines = ["commands, by layer:"]
+    """Lead with the builder path (the developer product), then the full command set
+    grouped by layer, then a one-line deprecated tier and the web-console pointer."""
+    path_width = max(len(cmd) for cmd in BUILDER_PATH)
+    lines = ["the builder path — install, ship, prove:"]
+    for cmd in BUILDER_PATH:
+        summary = COMMAND_LAYERS.get(cmd, ("", ""))[1]
+        lines.append(f"  {cmd.ljust(path_width)}  {summary}")
+    lines.append("")
+    lines.append("commands, by layer:")
     for name, definition in LAYERS:
+        commands = commands_for_layer(name)
+        if not commands:
+            continue
         lines.append("")
         lines.append(f"  {name} — {definition}")
-        for cmd, summary in commands_for_layer(name):
+        for cmd, summary in commands:
             lines.append(f"    {cmd:<10} {summary}")
     lines.append("")
+    lines.append("deprecated (still work; each prints where it moved):")
+    lines.append(f"  {', '.join(sorted(DEPRECATED_COMMANDS))}")
+    lines.append("")
+    lines.append("teams — approvals, policies, org, billing — live in the web console:")
+    lines.append("  https://invokehq.run/dashboard")
     lines.append("Run `invoke layers` for the model, or `invoke <command> --help` for a command.")
     return "\n".join(lines)
 
@@ -2684,14 +2973,14 @@ def build_parser() -> argparse.ArgumentParser:
     dev.add_argument("--dry-run", action="store_true", help="Print the local MCP URL without starting the server.")
     dev.set_defaults(func=dev_command)
 
-    tools = subparsers.add_parser("tools", help="List available tools.")
+    tools = subparsers.add_parser("tools", description="Deprecated: list available tools (use `invoke gateway tools`).")
     tools.add_argument("query", nargs="?", help="Optional search query.")
     tools.add_argument("--json", action="store_true", help="Print the full JSON response.")
     tools.add_argument("--base-url", help="Override Invoke runtime URL.")
     tools.add_argument("--api-key", help="Override Invoke API key.")
     tools.set_defaults(func=tools_command)
 
-    call = subparsers.add_parser("call", help="Call a tool through Invoke.")
+    call = subparsers.add_parser("call", description="Deprecated: call one tool (use `invoke gateway call`).")
     call.add_argument("tool", nargs="?", help="Tool id, for example linear.create_issue.")
     call.add_argument("params", nargs="?", default="{}", help="JSON params object.")
     call.add_argument("--agent-id", default="cli_agent")
@@ -2700,7 +2989,10 @@ def build_parser() -> argparse.ArgumentParser:
     call.add_argument("--api-key", help="Override Invoke API key.")
     call.set_defaults(func=call_command)
 
-    approvals = subparsers.add_parser("approvals", help="List or manage pending approvals.")
+    approvals = subparsers.add_parser(
+        "approvals",
+        description="Deprecated: approvals are a team surface — review them in the web console.",
+    )
     approvals.add_argument(
         "approvals_action",
         nargs="?",
@@ -2715,7 +3007,7 @@ def build_parser() -> argparse.ArgumentParser:
     approvals.add_argument("--api-key", help="Override Invoke API key.")
     approvals.set_defaults(func=approvals_command)
 
-    search = subparsers.add_parser("search", help="Search live docs/context through Invoke.")
+    search = subparsers.add_parser("search", description="Deprecated: search live docs/context through Invoke.")
     search.add_argument("query", help="Search query, for example 'latest MCP agent failures'.")
     search.add_argument("--limit", type=int, default=5, help="Number of Exa results to return, 1-10.")
     search.add_argument("--json", action="store_true", help="Print the full JSON response.")
@@ -2723,7 +3015,9 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--api-key", help="Override Invoke API key.")
     search.set_defaults(func=search_command)
 
-    preflight = subparsers.add_parser("preflight", help="Simulate an agent action before execution.")
+    preflight = subparsers.add_parser(
+        "preflight", description="Deprecated: preflight now runs inside `invoke run`'s pipeline."
+    )
     preflight.add_argument("action", nargs="?", help="Action name, for example stripe.charge_customer.")
     preflight.add_argument("params", nargs="?", default="{}", help="JSON params object.")
     preflight.add_argument("--agent-id", default="cli_agent")
@@ -2734,7 +3028,7 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--api-key", help="Override Invoke API key.")
     preflight.set_defaults(func=preflight_command)
 
-    execute = subparsers.add_parser("execute", help="Execute an agent action through Invoke's control boundary.")
+    execute = subparsers.add_parser("execute", description="Deprecated: use `invoke run` or `invoke gateway call`.")
     execute.add_argument("action", nargs="?", help="Action name, for example stripe.charge_customer.")
     execute.add_argument("params", nargs="?", default="{}", help="JSON params object.")
     execute.add_argument("--agent-id", default="cli_agent")
@@ -2746,7 +3040,7 @@ def build_parser() -> argparse.ArgumentParser:
     execute.add_argument("--api-key", help="Override Invoke API key.")
     execute.set_defaults(func=execute_command)
 
-    workflow = subparsers.add_parser("workflow", help="Run a packaged Invoke workflow.")
+    workflow = subparsers.add_parser("workflow", description="Deprecated: run a packaged Invoke workflow.")
     workflow.add_argument(
         "workflow",
         choices=["safe-tool-execution", "live-context-retrieval", "failure-trace-visualization"],
@@ -2881,6 +3175,50 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("--api-key", help="Override Invoke API key.")
     logs.set_defaults(func=logs_command)
 
+    def _runtime_flags(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("--workspace", help="Workspace id to target (overrides the active one).")
+        sub.add_argument("--json", action="store_true", help="Print the full JSON response.")
+        sub.add_argument("--base-url", help="Override Invoke runtime URL.")
+        sub.add_argument("--api-key", help="Override Invoke API key.")
+
+    inspect_parser = subparsers.add_parser(
+        "inspect", help="Show a run's full story: pipeline, cost, and its exact ledger slice."
+    )
+    inspect_parser.add_argument("execution_id", nargs="?", default="last",
+                                help="Execution id, or 'last' (default).")
+    _runtime_flags(inspect_parser)
+    inspect_parser.set_defaults(func=inspect_command)
+
+    receipts = subparsers.add_parser(
+        "receipts", help="List, show, and cryptographically verify signed run receipts."
+    )
+    receipts.add_argument("receipt_id", nargs="?", help="Receipt id to show (omit to list).")
+    receipts.add_argument("--verify", action="store_true",
+                          help="Verify the receipt's hash, signature, and chain (whole ledger when no id).")
+    receipts.add_argument("--tool", help="Only receipts for this tool.")
+    receipts.add_argument("--agent-id", help="Only receipts for this agent.")
+    receipts.add_argument("--status", help="Only receipts with this status.")
+    receipts.add_argument("--limit", type=int, default=20, help="Max receipts to list.")
+    _runtime_flags(receipts)
+    receipts.set_defaults(func=receipts_command)
+
+    graph = subparsers.add_parser(
+        "graph", help="Render the workspace agent graph: agents, their tasks, and recent runs."
+    )
+    graph.add_argument("--limit", type=int, default=50, help="Recent executions to fold in.")
+    graph.add_argument("--runs", type=int, default=5, help="Runs to show per agent.")
+    _runtime_flags(graph)
+    graph.set_defaults(func=graph_command)
+
+    replay = subparsers.add_parser(
+        "replay", help="Re-run an execution with the same tool, params, and intent."
+    )
+    replay.add_argument("execution_id", nargs="?", default="last",
+                        help="Execution id, or 'last' (default).")
+    replay.add_argument("--agent-id", help="Attribute the replay to a different agent.")
+    _runtime_flags(replay)
+    replay.set_defaults(func=replay_command)
+
     return parser
 
 
@@ -2891,10 +3229,16 @@ def main(argv: list[str] | None = None) -> int:
         "calls": "call",
         "tool": "tools",
         "ls": "tools",
+        # familiar spellings that map onto the builder path
+        "trace": "inspect",
+        "watch": "logs",
     }
     if raw_args and raw_args[0] in aliases:
         raw_args[0] = aliases[raw_args[0]]
     args = parser.parse_args(raw_args)
+    note = DEPRECATED_COMMANDS.get(getattr(args, "command", "") or "")
+    if note:
+        print(f"invoke: note: {note}", file=sys.stderr)
     try:
         return args.func(args)
     except Exception as exc:
