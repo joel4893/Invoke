@@ -443,3 +443,39 @@ test("runtime observability commands redirect a gateway (ws_) workspace id", () 
     assert.match(result.stderr, /invoke gateway/, cmd);
   }
 });
+
+test("gateway --help lists the context and coordination subcommands", () => {
+  const result = spawnSync(process.execPath, [binPath, "gateway", "--help"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  for (const sub of ["context", "subscribe", "broadcast", "inbox"]) {
+    assert.match(result.stdout, new RegExp(sub), sub);
+  }
+});
+
+test("layers now attributes commands to Context and Coordination", () => {
+  const result = spawnSync(process.execPath, [binPath, "layers"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Context[\s\S]*commands: gateway context/);
+  assert.match(result.stdout, /Coordination[\s\S]*gateway subscribe/);
+});
+
+test("gateway broadcast rejects a non-JSON payload with actionable usage", () => {
+  const result = spawnSync(
+    process.execPath,
+    [binPath, "gateway", "broadcast", "research", "not-json", "--workspace", "ws_x"],
+    { cwd: repoRoot, env: envWithKey(), encoding: "utf8" }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /payload must be valid JSON/);
+});

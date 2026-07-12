@@ -2772,6 +2772,10 @@ COMMAND_LAYERS: dict[str, tuple[str, str]] = {
     "wrap": ("Execution", "Generate a tool wrapper project"),
     "dev": ("Execution", "Run a local MCP server for this project"),
     "gateway": ("Execution", "Point at and drive the hosted MCP gateway (governed tool calls)"),
+    "gateway context": ("Context", "Read the shared entity context every agent sees, with provenance"),
+    "gateway subscribe": ("Coordination", "Subscribe an agent to a broadcast topic"),
+    "gateway broadcast": ("Coordination", "Publish an event to every subscribed agent"),
+    "gateway inbox": ("Coordination", "Read the broadcasts delivered to an agent"),
     "status": ("Observability", "Runtime health and workspace dashboard"),
     "logs": ("Observability", "Show or follow the execution event log"),
     "inspect": ("Observability", "Show a run's full story: pipeline, cost, and its ledger slice"),
@@ -2820,8 +2824,9 @@ def layered_epilog() -> str:
             continue
         lines.append("")
         lines.append(f"  {name} — {definition}")
+        col = max(10, *(len(cmd) for cmd, _ in commands))
         for cmd, summary in commands:
-            lines.append(f"    {cmd:<10} {summary}")
+            lines.append(f"    {cmd:<{col}} {summary}")
     lines.append("")
     lines.append("deprecated (still work; each prints where it moved):")
     lines.append(f"  {', '.join(sorted(DEPRECATED_COMMANDS))}")
@@ -3108,6 +3113,144 @@ def gateway_logs_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# ───────────────────────── Context (layer 2): the shared entity graph ─────────────────────────
+
+
+def gateway_context_command(args: argparse.Namespace) -> int:
+    """The one governed source of truth every agent shares. With no id, lists the
+    entities in the workspace; with an entity id, shows its full provenance-bearing
+    context (properties, relations, memory, and the effects that touched it), and
+    --history shows who changed it and when."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    base_url, api_key = credentials["base_url"], credentials["api_key"]
+
+    entity_id = getattr(args, "entity_id", None)
+    if entity_id:
+        context = api_request(
+            "GET", base_url, f"/v1/workspaces/{workspace_id}/entities/{entity_id}/context", api_key
+        )
+        if getattr(args, "history", False):
+            history = api_request(
+                "GET", base_url, f"/v1/workspaces/{workspace_id}/entities/{entity_id}/history", api_key
+            )
+            if getattr(args, "json", False):
+                print(json.dumps({"context": context.get("context", context), "history": history}, indent=2))
+                return 0
+            revisions = history.get("revisions") if isinstance(history, dict) else []
+            print(f"Provenance for {entity_id} — {len(revisions or [])} revision(s):")
+            for rev in (revisions or []):
+                print(f"  v{rev.get('version', '?')}  {_fmt_when(rev.get('at'))}  by {rev.get('changed_by', '-')}")
+            return 0
+        payload = context.get("context", context) if isinstance(context, dict) else context
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    query = f"/v1/workspaces/{workspace_id}/entities?limit={args.limit}"
+    if getattr(args, "type", None):
+        query += f"&type={urllib.parse.quote(args.type)}"
+    response = api_request("GET", base_url, query, api_key)
+    entities = response.get("entities") if isinstance(response, dict) else []
+    entities = entities if isinstance(entities, list) else []
+    if getattr(args, "json", False):
+        print(json.dumps({"count": len(entities), "entities": entities}, indent=2))
+        return 0
+    if not entities:
+        print("No shared entities yet. They appear as governed calls resolve real-world")
+        print("resources (a customer, an issue, an invoice) into the workspace context.")
+        return 0
+    print("ENTITY\t\t\tTYPE\t\tKEY\t\tNAME\t\tUPDATED")
+    for e in entities:
+        eid = str(e.get("id", "-"))
+        etype = str(e.get("type", "-"))[:12]
+        key = str(e.get("key", "-"))[:14]
+        name = str(e.get("name") or "-")[:16]
+        print(f"{eid}\t{etype}\t{key}\t{name}\t{_fmt_when(e.get('updated_at'))}")
+    print(f"\n{len(entities)} entity(ies). Inspect one:  invoke gateway context <entity_id> [--history]")
+    return 0
+
+
+# ───────────────────────── Coordination (layer 3): agent broadcasts ─────────────────────────
+
+
+def gateway_subscribe_command(args: argparse.Namespace) -> int:
+    """Subscribe an agent to a broadcast topic (use '*' for all)."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    response = api_request(
+        "POST", credentials["base_url"],
+        f"/v1/workspaces/{workspace_id}/agents/{args.agent_id}/subscriptions",
+        credentials["api_key"], {"topic": args.topic},
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(response, indent=2))
+        return 0
+    created = response.get("created") if isinstance(response, dict) else None
+    verb = "subscribed to" if created else "already subscribed to"
+    print(f"{args.agent_id} {verb} '{args.topic}'.")
+    return 0
+
+
+def gateway_broadcast_command(args: argparse.Namespace) -> int:
+    """Publish a workspace event to every agent subscribed to its topic — the push
+    alternative to every agent re-reading shared state to discover the same thing."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    try:
+        payload = json.loads(args.payload)
+    except json.JSONDecodeError as exc:
+        raise CliUsageError(f"payload must be valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CliUsageError("payload must be a JSON object.")
+    body: dict[str, Any] = {"topic": args.topic, "payload": payload}
+    if getattr(args, "from_agent", None):
+        body["from_agent"] = args.from_agent
+    response = api_request(
+        "POST", credentials["base_url"], f"/v1/workspaces/{workspace_id}/broadcasts",
+        credentials["api_key"], body,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(response, indent=2))
+        return 0
+    delivered = response.get("delivered_to") if isinstance(response, dict) else []
+    delivered = delivered if isinstance(delivered, list) else []
+    if delivered:
+        print(f"Broadcast '{args.topic}' delivered to: {', '.join(delivered)}")
+    else:
+        print(f"Broadcast '{args.topic}' published — no subscribers yet "
+              f"(agents subscribe with `invoke gateway subscribe <agent> {args.topic}`).")
+    return 0
+
+
+def gateway_inbox_command(args: argparse.Namespace) -> int:
+    """Broadcasts matching an agent's subscriptions (newest first) — poll this to react."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    query = f"/v1/workspaces/{workspace_id}/agents/{args.agent_id}/inbox?limit={args.limit}"
+    if getattr(args, "since", None) is not None:
+        query += f"&since={args.since}"
+    response = api_request("GET", credentials["base_url"], query, credentials["api_key"])
+    inbox = response.get("inbox") if isinstance(response, dict) else []
+    inbox = inbox if isinstance(inbox, list) else []
+    if getattr(args, "json", False):
+        print(json.dumps(response, indent=2))
+        return 0
+    topics = response.get("topics") if isinstance(response, dict) else []
+    if not inbox:
+        subscribed = f" (subscribed to: {', '.join(topics)})" if topics else " (no subscriptions yet)"
+        print(f"{args.agent_id} inbox is empty{subscribed}.")
+        return 0
+    print(f"{args.agent_id} inbox — subscribed to: {', '.join(topics or [])}")
+    print("WHEN\t\tTOPIC\t\tFROM\t\tPAYLOAD")
+    for b in inbox:
+        when = _fmt_when(b.get("created_at") or b.get("ts"))
+        topic = str(b.get("topic", "-"))[:14]
+        frm = str(b.get("from_agent") or "-")[:14]
+        payload = json.dumps(b.get("payload") or {})[:48]
+        print(f"{when}\t{topic}\t{frm}\t{payload}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="invoke",
@@ -3371,6 +3514,54 @@ def build_parser() -> argparse.ArgumentParser:
     gw_logs.add_argument("--base-url", help="Override Invoke runtime URL.")
     gw_logs.add_argument("--api-key", help="Override Invoke API key.")
     gw_logs.set_defaults(func=gateway_logs_command)
+
+    gw_context = gateway_subparsers.add_parser(
+        "context", help="Show the shared entity context every agent reads, with provenance."
+    )
+    gw_context.add_argument("entity_id", nargs="?", help="Entity id to inspect (omit to list).")
+    gw_context.add_argument("--history", action="store_true", help="Show the entity's revision provenance.")
+    gw_context.add_argument("--type", help="Only entities of this type.")
+    gw_context.add_argument("--limit", type=int, default=50, help="Max entities to list.")
+    gw_context.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_context.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_context.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_context.add_argument("--api-key", help="Override Invoke API key.")
+    gw_context.set_defaults(func=gateway_context_command)
+
+    gw_subscribe = gateway_subparsers.add_parser(
+        "subscribe", help="Subscribe an agent to a broadcast topic (use '*' for all)."
+    )
+    gw_subscribe.add_argument("agent_id", help="Agent to subscribe.")
+    gw_subscribe.add_argument("topic", help="Topic to subscribe to (or '*').")
+    gw_subscribe.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_subscribe.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_subscribe.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_subscribe.add_argument("--api-key", help="Override Invoke API key.")
+    gw_subscribe.set_defaults(func=gateway_subscribe_command)
+
+    gw_broadcast = gateway_subparsers.add_parser(
+        "broadcast", help="Publish a workspace event to every agent subscribed to its topic."
+    )
+    gw_broadcast.add_argument("topic", help="Topic to publish on.")
+    gw_broadcast.add_argument("payload", nargs="?", default="{}", help="JSON payload object.")
+    gw_broadcast.add_argument("--from", dest="from_agent", help="Publishing agent id.")
+    gw_broadcast.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_broadcast.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_broadcast.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_broadcast.add_argument("--api-key", help="Override Invoke API key.")
+    gw_broadcast.set_defaults(func=gateway_broadcast_command)
+
+    gw_inbox = gateway_subparsers.add_parser(
+        "inbox", help="Read the broadcasts delivered to an agent's subscriptions."
+    )
+    gw_inbox.add_argument("agent_id", help="Agent whose inbox to read.")
+    gw_inbox.add_argument("--since", type=float, help="Only broadcasts after this epoch ts.")
+    gw_inbox.add_argument("--limit", type=int, default=50, help="Max broadcasts to show.")
+    gw_inbox.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_inbox.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_inbox.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_inbox.add_argument("--api-key", help="Override Invoke API key.")
+    gw_inbox.set_defaults(func=gateway_inbox_command)
 
     layers = subparsers.add_parser("layers", help="Explain the five Invoke layers.")
     layers.add_argument("--json", action="store_true", help="Print the layer model as JSON.")
