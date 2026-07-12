@@ -124,6 +124,32 @@ def mask_key(value: str) -> str:
     return value[:8] + "..." + value[-4:]
 
 
+# Whitespace + C0/C1 control bytes (e.g. \x16/SYN from a Ctrl-V paste) that must never
+# survive into a stored credential or an outgoing HTTP header.
+_CONTROL_WS_RE = re.compile(r"[\s\x00-\x1f\x7f]+")
+_KEY_PREFIX_RE = re.compile(r"ag_(?:live|test)_")
+
+
+def sanitize_api_key(raw: str | None) -> str:
+    """Clean an API key before it is stored or sent.
+
+    Interactive paste can inject control characters (e.g. ``\\x16``/SYN from Ctrl-V) or
+    duplicate the key several times in one line. We strip whitespace/control bytes and
+    reject an obviously duplicated paste rather than silently persisting a corrupted
+    credential that only "works" because ``INVOKE_API_KEY`` happens to override it.
+    """
+    if not raw:
+        return ""
+    cleaned = _CONTROL_WS_RE.sub("", raw)
+    if len(_KEY_PREFIX_RE.findall(cleaned)) > 1:
+        raise CliUsageError(
+            "That API key looks duplicated/garbled — the key prefix appears more than "
+            "once (a common paste artifact). Re-run with a single clean key:\n"
+            "  invoke login --api-key <your_key>"
+        )
+    return cleaned
+
+
 def load_credentials() -> dict[str, str]:
     stored = load_json_file(credentials_path(), {})
     if not stored and legacy_credentials_path().exists():
@@ -137,7 +163,11 @@ def load_credentials() -> dict[str, str]:
             or stored.get("baseUrl")
             or DEFAULT_API_URL
         ),
-        "api_key": os.getenv("INVOKE_API_KEY") or stored.get("api_key") or stored.get("apiKey") or "",
+        # Defensively strip control bytes on read so an already-corrupted config file
+        # can never send raw control characters in the X-API-Key header.
+        "api_key": _CONTROL_WS_RE.sub(
+            "", os.getenv("INVOKE_API_KEY") or stored.get("api_key") or stored.get("apiKey") or ""
+        ),
     }
 
 
@@ -157,7 +187,7 @@ def save_config_store(store: dict[str, Any]) -> None:
 
 def write_credentials(base_url: str, api_key: str) -> None:
     cleaned_base_url = base_url.rstrip("/")
-    cleaned_api_key = api_key.strip()
+    cleaned_api_key = sanitize_api_key(api_key)
     store = load_config_store()
     store.update(
         {
@@ -168,6 +198,20 @@ def write_credentials(base_url: str, api_key: str) -> None:
         }
     )
     save_config_store(store)
+
+
+def gateway_redirect(workspace_id: str, equivalent: str) -> bool:
+    """Runtime-plane observability (rws_) and the gateway effect ledger (ws_) are
+    separate id-spaces. If a gateway id is handed to a runtime command, redirect to the
+    gateway equivalent instead of letting the runtime endpoint 404 confusingly."""
+    if str(workspace_id).startswith("ws_"):
+        print(
+            f"{workspace_id} is a gateway (effect-ledger) workspace, not a runtime workspace.\n"
+            f"Use the gateway equivalent:  invoke {equivalent} --workspace {workspace_id}",
+            file=sys.stderr,
+        )
+        return True
+    return False
 
 
 def stored_workspace() -> str | None:
@@ -1144,7 +1188,12 @@ def config_command(args: argparse.Namespace) -> int:
     if args.key:
         normalized_key = normalize_config_key(args.key)
         if args.value is None:
-            print(config[normalized_key])
+            value = config[normalized_key]
+            # Mask the secret by default — consistent with `config` and `config --json`.
+            # Pass --reveal to print it in full (e.g. for `export KEY=$(...)`).
+            if normalized_key == "api_key" and value and not getattr(args, "reveal", False):
+                value = mask_key(value)
+            print(value)
             return 0
         updated = dict(credentials)
         updated[normalized_key] = args.value.strip()
@@ -1306,6 +1355,8 @@ def print_events(events: list[dict[str, Any]]) -> None:
 def logs_command(args: argparse.Namespace) -> int:
     creds = require_credentials(args)
     workspace_id = load_workspace(args)
+    if gateway_redirect(workspace_id, "gateway logs"):
+        return 2
     query = f"/events?after_seq={args.since}&limit={args.limit}&order=asc"
     if args.types:
         query += f"&types={urllib.parse.quote(args.types)}"
@@ -1365,7 +1416,19 @@ def watch_task(creds: dict[str, str], workspace_id: str, task_id: str, timeout_s
             print(f"✔ Task {status}")
             return 0 if status == "done" else 1
         time.sleep(1.5)
-    print(f"… still {last_status or 'queued'} — watch with `invoke logs -f` or `invoke status`.")
+    if (last_status or "queued") == "queued":
+        # No agent has claimed it. `run` enqueues coordination work; the runtime does not
+        # execute tasks itself — a running agent must claim it. Say so plainly instead of
+        # implying progress that will never come.
+        print(
+            "… task is still queued — no agent has claimed it yet.\n"
+            "  `invoke run` enqueues a task for an agent to claim; the runtime does not\n"
+            "  execute it for you. To run one governed tool call directly (with dedup +\n"
+            "  a signed receipt), use `invoke gateway call <tool> '<json>'`.\n"
+            "  Track this task with `invoke graph` or `invoke logs -f`."
+        )
+    else:
+        print(f"… still {last_status} — watch with `invoke logs -f` or `invoke status`.")
     return 0
 
 
@@ -1463,6 +1526,8 @@ def print_execution_summary(execution: dict[str, Any], receipt: dict[str, Any] |
 def inspect_command(args: argparse.Namespace) -> int:
     creds = require_credentials(args)
     workspace_id = load_workspace(args)
+    if gateway_redirect(workspace_id, "gateway receipts"):
+        return 2
     exec_id = resolve_execution_ref(creds, workspace_id, args.execution_id)
     detail = runtime_request("GET", creds, workspace_id, f"/executions/{exec_id}")
     events = runtime_request("GET", creds, workspace_id, f"/executions/{exec_id}/events")
@@ -1490,6 +1555,8 @@ def inspect_command(args: argparse.Namespace) -> int:
 def replay_command(args: argparse.Namespace) -> int:
     creds = require_credentials(args)
     workspace_id = load_workspace(args)
+    if gateway_redirect(workspace_id, "gateway receipts"):
+        return 2
     exec_id = resolve_execution_ref(creds, workspace_id, args.execution_id)
     body: dict[str, Any] = {}
     if getattr(args, "agent_id", None):
@@ -1519,6 +1586,8 @@ def replay_command(args: argparse.Namespace) -> int:
 def receipts_command(args: argparse.Namespace) -> int:
     creds = require_credentials(args)
     workspace_id = load_workspace(args)
+    if gateway_redirect(workspace_id, "gateway receipts"):
+        return 2
     receipt_id = getattr(args, "receipt_id", None)
     if receipt_id and args.verify:
         response = runtime_request("GET", creds, workspace_id, f"/receipts/{receipt_id}/verify")
@@ -1604,6 +1673,8 @@ def graph_command(args: argparse.Namespace) -> int:
     and recent runs — the same picture as the web console's Agent Graph."""
     creds = require_credentials(args)
     workspace_id = load_workspace(args)
+    if gateway_redirect(workspace_id, "gateway status"):
+        return 2
     agents = runtime_request("GET", creds, workspace_id, "/agents").get("agents") or []
     tasks = runtime_request("GET", creds, workspace_id, "/tasks").get("tasks") or []
     executions = runtime_request(
@@ -1689,6 +1760,25 @@ def doctor_command(args: argparse.Namespace) -> int:
     print(f"\nHealth: {health.get('status', 'ok')}")
     if health.get("db"):
         print(f"DB: {health.get('db')}")
+
+    # `db: ok` above is the durable main store (Supabase/Postgres). The workspace/effect
+    # ledger can live on a SEPARATE store — if that one is ephemeral, workspaces silently
+    # 404 after every restart. Surface it instead of implying everything is durable.
+    workspace_db = health.get("workspace_db") if isinstance(health.get("workspace_db"), dict) else None
+    if workspace_db:
+        backend = workspace_db.get("backend", "?")
+        durable = workspace_db.get("durable")
+        print(f"Workspace DB: {backend}" + ("" if durable is None else f" (durable: {str(bool(durable)).lower()})"))
+        if durable is False:
+            path = workspace_db.get("path", "?")
+            print(
+                f"\n⚠  Workspace store is NOT durable ({backend} at {path}).\n"
+                "   Workspaces and their effect ledgers are lost on every runtime restart\n"
+                "   (this is why previously-created workspaces start returning 404).\n"
+                "   Fix on the runtime host: set DATABASE_URL to Postgres, or point\n"
+                "   WORKSPACE_DB at a mounted persistent disk, then restart."
+            )
+            return 1
     return 0
 
 
@@ -1928,7 +2018,7 @@ def init_command(args: argparse.Namespace) -> int:
 
             ```bash
             invoke deploy
-            invoke call system.status '{{}}'
+            invoke run system_status
             ```
 
             Edit `invoke.json` to add production tools or point `mcp_url` at your hosted MCP server.
@@ -2894,16 +2984,127 @@ def gateway_call_command(args: argparse.Namespace) -> int:
 def gateway_status_command(args: argparse.Namespace) -> int:
     credentials = require_credentials(args)
     workspace_id = load_gateway_workspace(args)
-    response = api_request(
-        "GET", credentials["base_url"], f"/v1/workspaces/{workspace_id}/mcp", credentials["api_key"]
-    )
+    base_url, api_key = credentials["base_url"], credentials["api_key"]
+    descriptor = api_request("GET", base_url, f"/v1/workspaces/{workspace_id}/mcp", api_key)
+    # The MCP descriptor alone can't answer "what has it spent / how many calls" — fold in
+    # the workspace record (budget) and the effect ledger (governed-call count).
+    workspace = api_request("GET", base_url, f"/v1/workspaces/{workspace_id}", api_key)
+    ws = workspace.get("workspace", workspace) if isinstance(workspace, dict) else {}
+    budget = ws.get("budget") if isinstance(ws.get("budget"), dict) else {}
+    effects_resp = api_request("GET", base_url, f"/v1/workspaces/{workspace_id}/effects?limit=500", api_key)
+    effects = effects_resp.get("effects") if isinstance(effects_resp, dict) else []
+    effects = effects if isinstance(effects, list) else []
+    committed = sum(1 for e in effects if e.get("status") == "committed")
+
     if getattr(args, "json", False):
-        print(json.dumps(response, indent=2))
+        print(json.dumps({"descriptor": descriptor, "workspace": ws, "effects_count": len(effects)}, indent=2))
         return 0
-    print(f"Gateway workspace: {workspace_id}")
-    print(f"MCP URL: {gateway_mcp_url(credentials['base_url'], workspace_id)}")
-    print(f"Transport: {response.get('transport', '-')}")
-    print(f"Tools available: {response.get('tools_available', 0)}")
+    print(f"Gateway workspace: {ws.get('name', workspace_id)} ({workspace_id})")
+    print(f"MCP URL: {gateway_mcp_url(base_url, workspace_id)}")
+    print(f"Transport: {descriptor.get('transport', '-')}")
+    print(f"Tools available: {descriptor.get('tools_available', 0)}")
+    if budget:
+        state = budget.get("state", "-")
+        print(f"Budget: {fmt_cost(budget.get('spent_micros', 0))} spent / "
+              f"{fmt_cost(budget.get('limit_micros', 0))} limit "
+              f"({fmt_cost(budget.get('remaining_micros', 0))} left, {state})")
+    print(f"Governed calls: {len(effects)} effects ({committed} committed)")
+    if effects:
+        print("Inspect them:  invoke gateway receipts   ·   event stream:  invoke gateway logs")
+    return 0
+
+
+# Column widths for the gateway receipts/logs tables.
+def _fmt_when(iso: Any) -> str:
+    raw = str(iso or "")
+    # 2026-07-11T19:45:39Z → 19:45:39
+    if "T" in raw:
+        return raw.split("T", 1)[1].replace("Z", "")[:8]
+    return raw[:19]
+
+
+def gateway_receipts_command(args: argparse.Namespace) -> int:
+    """Every governed gateway call is a receipt. Lists the effect ledger, shows one
+    effect's signed receipt, or verifies it — the ws_ plane's answer to `invoke receipts`."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    base_url, api_key = credentials["base_url"], credentials["api_key"]
+
+    receipt_id = getattr(args, "receipt_id", None)
+    if receipt_id:
+        response = api_request(
+            "GET", base_url, f"/v1/workspaces/{workspace_id}/effects/{receipt_id}/receipt", api_key
+        )
+        receipt = response.get("receipt", response) if isinstance(response, dict) else response
+        if getattr(args, "json", False):
+            print(json.dumps(response, indent=2))
+            return 0
+        signature = receipt.get("signature") if isinstance(receipt, dict) else None
+        print(json.dumps(receipt, indent=2))
+        if getattr(args, "verify", False):
+            ok = bool(signature)
+            print(f"\nSignature: {'present — receipt is cryptographically signed' if ok else 'MISSING'}")
+            return 0 if ok else 1
+        return 0
+
+    response = api_request(
+        "GET", base_url, f"/v1/workspaces/{workspace_id}/effects?limit={args.limit}", api_key
+    )
+    effects = response.get("effects") if isinstance(response, dict) else []
+    effects = effects if isinstance(effects, list) else []
+    if args.agent_id:
+        effects = [e for e in effects if e.get("agent_id") == args.agent_id]
+    if args.status:
+        effects = [e for e in effects if e.get("status") == args.status]
+    if args.tool:
+        effects = [e for e in effects if (e.get("action_type") == args.tool or e.get("target") == args.tool)]
+    if getattr(args, "json", False):
+        print(json.dumps({"count": len(effects), "effects": effects}, indent=2))
+        return 0
+    if not effects:
+        print("No governed calls yet in this gateway workspace.")
+        print("Route one through the ledger:  invoke gateway call <tool> '<json>'")
+        return 0
+    print("RECEIPT\t\tAGENT\t\tTOOL\t\t\tSTATUS\t\tCOST\tWHEN")
+    for e in effects:
+        rid = str(e.get("effect_id", "-"))
+        agent = str(e.get("agent_id", "-"))[:14]
+        tool = str(e.get("target") or e.get("action_type") or "-")[:20]
+        status = str(e.get("status", "-"))[:12]
+        cost = fmt_cost(e.get("cost_micros", 0))
+        when = _fmt_when(e.get("created_at"))
+        print(f"{rid}\t{agent}\t{tool}\t{status}\t{cost}\t{when}")
+    print(f"\n{len(effects)} governed call(s). Prove one:  invoke gateway receipts <receipt_id> --verify")
+    return 0
+
+
+def gateway_logs_command(args: argparse.Namespace) -> int:
+    """The gateway workspace's raw event stream (admissions, denials, replays) — the
+    ws_ plane's answer to `invoke logs`."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    base_url, api_key = credentials["base_url"], credentials["api_key"]
+    response = api_request(
+        "GET", base_url, f"/v1/workspaces/{workspace_id}/events?limit={args.limit}", api_key
+    )
+    events = response.get("events") if isinstance(response, dict) else []
+    events = events if isinstance(events, list) else []
+    if args.type:
+        wanted = {t.strip() for t in args.type.split(",") if t.strip()}
+        events = [e for e in events if e.get("type") in wanted]
+    if getattr(args, "json", False):
+        print(json.dumps({"count": len(events), "events": events}, indent=2))
+        return 0
+    if not events:
+        print("No events yet in this gateway workspace — try `invoke gateway call <tool> '<json>'`.")
+        return 0
+    # Backend returns newest-first; show oldest-first so a tail reads naturally.
+    for e in reversed(events):
+        when = _fmt_when(e.get("created_at") or e.get("at"))
+        etype = str(e.get("type", "event"))
+        agent = e.get("agent_id")
+        suffix = f"  · {agent}" if agent else ""
+        print(f"{when}  {etype}{suffix}")
     return 0
 
 
@@ -2940,6 +3141,7 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("key", nargs="?", help="Config key to read or update: base-url or api-key.")
     config.add_argument("value", nargs="?", help="New config value.")
     config.add_argument("--json", action="store_true", help="Print config as JSON with the API key masked.")
+    config.add_argument("--reveal", action="store_true", help="Print the API key in full instead of masked.")
     config.set_defaults(func=config_command)
 
     init = subparsers.add_parser("init", help="Scaffold an Invoke project.")
@@ -3143,6 +3345,32 @@ def build_parser() -> argparse.ArgumentParser:
     gw_status.add_argument("--base-url", help="Override Invoke runtime URL.")
     gw_status.add_argument("--api-key", help="Override Invoke API key.")
     gw_status.set_defaults(func=gateway_status_command)
+
+    gw_receipts = gateway_subparsers.add_parser(
+        "receipts", help="List, show, and verify signed receipts for governed gateway calls."
+    )
+    gw_receipts.add_argument("receipt_id", nargs="?", help="Effect id to show (omit to list).")
+    gw_receipts.add_argument("--verify", action="store_true", help="Verify the shown receipt is signed.")
+    gw_receipts.add_argument("--tool", help="Only receipts for this tool.")
+    gw_receipts.add_argument("--agent-id", help="Only receipts for this agent.")
+    gw_receipts.add_argument("--status", help="Only receipts with this status.")
+    gw_receipts.add_argument("--limit", type=int, default=50, help="Max receipts to list.")
+    gw_receipts.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_receipts.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_receipts.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_receipts.add_argument("--api-key", help="Override Invoke API key.")
+    gw_receipts.set_defaults(func=gateway_receipts_command)
+
+    gw_logs = gateway_subparsers.add_parser(
+        "logs", help="Show the gateway workspace's governed event stream."
+    )
+    gw_logs.add_argument("--limit", type=int, default=50, help="Max events to show.")
+    gw_logs.add_argument("--type", help="Comma-separated event types to include.")
+    gw_logs.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_logs.add_argument("--json", action="store_true", help="Print raw event JSON.")
+    gw_logs.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_logs.add_argument("--api-key", help="Override Invoke API key.")
+    gw_logs.set_defaults(func=gateway_logs_command)
 
     layers = subparsers.add_parser("layers", help="Explain the five Invoke layers.")
     layers.add_argument("--json", action="store_true", help="Print the layer model as JSON.")

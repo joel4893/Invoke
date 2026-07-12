@@ -379,3 +379,67 @@ test("gateway url without an active gateway workspace explains how to select one
   assert.match(result.stderr, /No active gateway workspace/);
   assert.match(result.stderr, /invoke gateway create/);
 });
+
+test("gateway --help lists the new observability subcommands (receipts, logs)", () => {
+  const result = spawnSync(process.execPath, [binPath, "gateway", "--help"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /receipts/);
+  assert.match(result.stdout, /logs/);
+});
+
+test("login rejects a duplicated/garbled API key instead of silently saving it", () => {
+  const result = spawnSync(
+    process.execPath,
+    [binPath, "login", "--base-url", "https://x.test", "--api-key", "ag_live_ABC\x16ag_live_ABC"],
+    { cwd: repoRoot, env: isolatedEnv(), encoding: "utf8" }
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /duplicated|garbled/i);
+});
+
+test("login strips stray control characters from a single pasted key", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "invoke-home-"));
+  const env = { ...process.env, INVOKE_HOME: home, INVOKE_BASE_URL: "", INVOKE_API_KEY: "" };
+  const login = spawnSync(
+    process.execPath,
+    [binPath, "login", "--base-url", "https://x.test", "--api-key", "  ag_live_CLEAN123\t"],
+    { cwd: repoRoot, env, encoding: "utf8" }
+  );
+  assert.equal(login.status, 0, login.stderr);
+  const stored = JSON.parse(fs.readFileSync(path.join(home, "config.json"), "utf8"));
+  assert.equal(stored.apiKey, "ag_live_CLEAN123");
+});
+
+test("config api-key masks by default and --reveal prints it in full", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "invoke-home-"));
+  const env = { ...process.env, INVOKE_HOME: home, INVOKE_BASE_URL: "", INVOKE_API_KEY: "" };
+  spawnSync(process.execPath, [binPath, "login", "--base-url", "https://x.test", "--api-key", "ag_live_SECRET1234567890"],
+    { cwd: repoRoot, env, encoding: "utf8" });
+
+  const masked = spawnSync(process.execPath, [binPath, "config", "api-key"], { cwd: repoRoot, env, encoding: "utf8" });
+  const revealed = spawnSync(process.execPath, [binPath, "config", "api-key", "--reveal"], { cwd: repoRoot, env, encoding: "utf8" });
+
+  assert.equal(masked.status, 0, masked.stderr);
+  assert.match(masked.stdout, /ag_live_\.\.\.7890/);
+  assert.doesNotMatch(masked.stdout, /SECRET/);
+  assert.match(revealed.stdout, /ag_live_SECRET1234567890/);
+});
+
+test("runtime observability commands redirect a gateway (ws_) workspace id", () => {
+  for (const cmd of ["receipts", "logs", "graph", "inspect", "replay"]) {
+    const result = spawnSync(process.execPath, [binPath, cmd, "--workspace", "ws_deadbeef"], {
+      cwd: repoRoot,
+      env: envWithKey(),
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 2, `${cmd}: ${result.stdout}${result.stderr}`);
+    assert.match(result.stderr, /gateway \(effect-ledger\) workspace/, cmd);
+    assert.match(result.stderr, /invoke gateway/, cmd);
+  }
+});
