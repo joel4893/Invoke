@@ -3125,14 +3125,14 @@ def _fetch_memory(base_url: str, workspace_id: str, api_key: str) -> list:
 
 
 def _render_memory_table(facts: list) -> None:
-    print("KEY\t\tCONTENT\t\t\t\tBY\t\tVER\tSTALE")
+    print("KEY\t\tCONTENT\t\t\t\tBY\t\tVER\tFLAGS")
     for m in facts:
         key = str(m.get("key") or "-")[:14]
         content = str(m.get("content") or "").replace("\n", " ")[:30]
         by = str(m.get("updated_by") or m.get("creator_agent") or "-")[:12]
         ver = m.get("version", 1)
-        stale = "STALE" if m.get("stale") else "fresh"
-        print(f"{key}\t{content}\t{by}\tv{ver}\t{stale}")
+        flags = [f for f, on in (("STALE", m.get("stale")), ("contested", m.get("contested"))) if on]
+        print(f"{key}\t{content}\t{by}\tv{ver}\t{','.join(flags) or 'fresh'}")
 
 
 def gateway_context_command(args: argparse.Namespace) -> int:
