@@ -2773,6 +2773,7 @@ COMMAND_LAYERS: dict[str, tuple[str, str]] = {
     "dev": ("Execution", "Run a local MCP server for this project"),
     "gateway": ("Execution", "Point at and drive the hosted MCP gateway (governed tool calls)"),
     "gateway context": ("Context", "Read the shared entity context every agent sees, with provenance"),
+    "gateway memory": ("Context", "Read/write the shared facts (ws_memory) every agent sees"),
     "gateway subscribe": ("Coordination", "Subscribe an agent to a broadcast topic"),
     "gateway broadcast": ("Coordination", "Publish an event to every subscribed agent"),
     "gateway inbox": ("Coordination", "Read the broadcasts delivered to an agent"),
@@ -3116,11 +3117,28 @@ def gateway_logs_command(args: argparse.Namespace) -> int:
 # ───────────────────────── Context (layer 2): the shared entity graph ─────────────────────────
 
 
+def _fetch_memory(base_url: str, workspace_id: str, api_key: str) -> list:
+    """The workspace's shared memory (ws_memory) — the keyed facts every agent reads."""
+    resp = api_request("GET", base_url, f"/v1/workspaces/{workspace_id}/memory", api_key)
+    facts = resp.get("memory") if isinstance(resp, dict) else []
+    return facts if isinstance(facts, list) else []
+
+
+def _render_memory_table(facts: list) -> None:
+    print("KEY\t\tCONTENT\t\t\t\tBY\t\tVER\tSTALE")
+    for m in facts:
+        key = str(m.get("key") or "-")[:14]
+        content = str(m.get("content") or "").replace("\n", " ")[:30]
+        by = str(m.get("updated_by") or m.get("creator_agent") or "-")[:12]
+        ver = m.get("version", 1)
+        stale = "STALE" if m.get("stale") else "fresh"
+        print(f"{key}\t{content}\t{by}\tv{ver}\t{stale}")
+
+
 def gateway_context_command(args: argparse.Namespace) -> int:
-    """The one governed source of truth every agent shares. With no id, lists the
-    entities in the workspace; with an entity id, shows its full provenance-bearing
-    context (properties, relations, memory, and the effects that touched it), and
-    --history shows who changed it and when."""
+    """The one governed source of truth every agent shares. With no id, shows the
+    workspace context — resolved entities AND the shared memory facts. With an entity
+    id, shows its full provenance-bearing context; --history shows who changed it."""
     credentials = require_credentials(args)
     workspace_id = load_gateway_workspace(args)
     base_url, api_key = credentials["base_url"], credentials["api_key"]
@@ -3146,27 +3164,89 @@ def gateway_context_command(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
         return 0
 
+    # List view = the full workspace context: resolved entities + shared memory facts.
     query = f"/v1/workspaces/{workspace_id}/entities?limit={args.limit}"
     if getattr(args, "type", None):
         query += f"&type={urllib.parse.quote(args.type)}"
     response = api_request("GET", base_url, query, api_key)
     entities = response.get("entities") if isinstance(response, dict) else []
     entities = entities if isinstance(entities, list) else []
+    memory = _fetch_memory(base_url, workspace_id, api_key)
     if getattr(args, "json", False):
-        print(json.dumps({"count": len(entities), "entities": entities}, indent=2))
+        print(json.dumps({"entities": entities, "memory": memory}, indent=2))
         return 0
-    if not entities:
-        print("No shared entities yet. They appear as governed calls resolve real-world")
-        print("resources (a customer, an issue, an invoice) into the workspace context.")
+
+    print(f"ENTITIES ({len(entities)}) — real-world resources agents share")
+    if entities:
+        print("ENTITY\t\t\tTYPE\t\tKEY\t\tNAME\t\tUPDATED")
+        for e in entities:
+            eid = str(e.get("id", "-"))
+            etype = str(e.get("type", "-"))[:12]
+            key = str(e.get("key", "-"))[:14]
+            name = str(e.get("name") or "-")[:16]
+            print(f"{eid}\t{etype}\t{key}\t{name}\t{_fmt_when(e.get('updated_at'))}")
+    else:
+        print("  (none yet — governed calls resolve resources like a customer/issue into these)")
+
+    print(f"\nMEMORY ({len(memory)}) — shared facts every agent reads")
+    if memory:
+        _render_memory_table(memory)
+    else:
+        print("  (none yet — write one: invoke gateway memory <key> --set '<fact>' --agent-id <a>)")
+    print("\nInspect an entity:  invoke gateway context <entity_id> [--history]"
+          "   ·   a fact:  invoke gateway memory <key>")
+    return 0
+
+
+def gateway_memory_command(args: argparse.Namespace) -> int:
+    """Read/write the workspace's shared memory — the governed facts every agent sees.
+    No key lists all facts; a key shows one; --set writes/upserts that key."""
+    credentials = require_credentials(args)
+    workspace_id = load_gateway_workspace(args)
+    base_url, api_key = credentials["base_url"], credentials["api_key"]
+    key = getattr(args, "key", None)
+    set_value = getattr(args, "set_value", None)
+
+    if set_value is not None:
+        if not key:
+            raise CliUsageError(
+                "Provide a key to write.\n"
+                "Usage: invoke gateway memory <key> --set '<content>' --agent-id <agent>"
+            )
+        body: dict[str, Any] = {"key": key, "content": set_value}
+        if getattr(args, "agent_id", None):
+            body["creator_agent"] = args.agent_id
+        if getattr(args, "ttl", None) is not None:
+            body["ttl_seconds"] = args.ttl
+        if getattr(args, "tags", None):
+            body["tags"] = [t.strip() for t in args.tags.split(",") if t.strip()]
+        resp = api_request("POST", base_url, f"/v1/workspaces/{workspace_id}/memory", api_key, body)
+        if getattr(args, "json", False):
+            print(json.dumps(resp, indent=2))
+            return 0
+        m = resp.get("memory", {}) if isinstance(resp, dict) else {}
+        who = m.get("updated_by") or m.get("creator_agent") or "-"
+        print(f"Wrote '{key}' v{m.get('version', '?')} (by {who}).")
+        if isinstance(resp, dict) and resp.get("conflict"):
+            print("⚠  conflict: this key already held a different value — the prior is kept in revisions.")
         return 0
-    print("ENTITY\t\t\tTYPE\t\tKEY\t\tNAME\t\tUPDATED")
-    for e in entities:
-        eid = str(e.get("id", "-"))
-        etype = str(e.get("type", "-"))[:12]
-        key = str(e.get("key", "-"))[:14]
-        name = str(e.get("name") or "-")[:16]
-        print(f"{eid}\t{etype}\t{key}\t{name}\t{_fmt_when(e.get('updated_at'))}")
-    print(f"\n{len(entities)} entity(ies). Inspect one:  invoke gateway context <entity_id> [--history]")
+
+    facts = _fetch_memory(base_url, workspace_id, api_key)
+    if key:
+        facts = [m for m in facts if m.get("key") == key]
+    if getattr(args, "json", False):
+        print(json.dumps({"count": len(facts), "memory": facts}, indent=2))
+        return 0
+    if not facts:
+        target = f"key '{key}'" if key else "this workspace"
+        print(f"No shared memory for {target}.")
+        print("Write one:  invoke gateway memory <key> --set '<fact>' --agent-id <agent>")
+        return 0
+    if key and len(facts) == 1:  # single-fact detail view
+        print(json.dumps(facts[0], indent=2))
+        return 0
+    _render_memory_table(facts)
+    print(f"\n{len(facts)} fact(s). Show one:  invoke gateway memory <key>")
     return 0
 
 
@@ -3527,6 +3607,22 @@ def build_parser() -> argparse.ArgumentParser:
     gw_context.add_argument("--base-url", help="Override Invoke runtime URL.")
     gw_context.add_argument("--api-key", help="Override Invoke API key.")
     gw_context.set_defaults(func=gateway_context_command)
+
+    gw_memory = gateway_subparsers.add_parser(
+        "memory", help="Read/write the workspace's shared memory (facts every agent sees)."
+    )
+    gw_memory.add_argument("key", nargs="?", help="Fact key to show (omit to list).")
+    gw_memory.add_argument("--set", dest="set_value", metavar="CONTENT",
+                           help="Write/upsert this key's content (needs a key).")
+    gw_memory.add_argument("--agent-id", help="Agent writing the fact (provenance).")
+    gw_memory.add_argument("--ttl", type=int, metavar="SECONDS",
+                           help="Mark the fact stale after this many seconds.")
+    gw_memory.add_argument("--tags", help="Comma-separated tags for the fact.")
+    gw_memory.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
+    gw_memory.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    gw_memory.add_argument("--base-url", help="Override Invoke runtime URL.")
+    gw_memory.add_argument("--api-key", help="Override Invoke API key.")
+    gw_memory.set_defaults(func=gateway_memory_command)
 
     gw_subscribe = gateway_subparsers.add_parser(
         "subscribe", help="Subscribe an agent to a broadcast topic (use '*' for all)."

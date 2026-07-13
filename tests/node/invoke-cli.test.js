@@ -479,3 +479,30 @@ test("gateway broadcast rejects a non-JSON payload with actionable usage", () =>
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /payload must be valid JSON/);
 });
+
+test("gateway --help lists the shared-memory subcommand", () => {
+  const result = spawnSync(process.execPath, [binPath, "gateway", "--help"], {
+    cwd: repoRoot, env: isolatedEnv(), encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /memory/);
+});
+
+test("gateway memory --set without a key prints actionable usage", () => {
+  const result = spawnSync(
+    process.execPath,
+    [binPath, "gateway", "memory", "--set", "hello", "--workspace", "ws_x"],
+    { cwd: repoRoot, env: envWithKey(), encoding: "utf8" }
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Provide a key/);
+  assert.match(result.stderr, /gateway memory <key> --set/);
+});
+
+test("layers attributes gateway memory to the Context layer", () => {
+  const result = spawnSync(process.execPath, [binPath, "layers"], {
+    cwd: repoRoot, env: isolatedEnv(), encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Context[\s\S]*gateway memory/);
+});
