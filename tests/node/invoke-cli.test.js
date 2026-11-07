@@ -134,7 +134,7 @@ function envWithKey() {
   return { ...isolatedEnv(), INVOKE_API_KEY: "inv_test_offline_key", INVOKE_WORKSPACE: "" };
 }
 
-test("top-level help leads with the builder path, then groups by layer", () => {
+test("top-level help leads with the gateway path, then groups by layer", () => {
   const result = spawnSync(process.execPath, [binPath, "--help"], {
     cwd: repoRoot,
     env: isolatedEnv(),
@@ -142,33 +142,42 @@ test("top-level help leads with the builder path, then groups by layer", () => {
   });
 
   assert.equal(result.status, 0, result.stderr);
-  // The builder path is the headline: eight commands in install -> prove order.
-  const path = result.stdout.indexOf("the builder path");
+  // The gateway path is the headline, before the layer grouping.
+  const start = result.stdout.indexOf("start here");
   const byLayer = result.stdout.indexOf("commands, by layer:");
-  assert.ok(path >= 0 && byLayer > path, "builder path should precede the layer grouping");
-  for (const cmd of ["login", "init", "deploy", "run", "inspect", "receipts", "graph", "replay"]) {
-    assert.match(result.stdout, new RegExp(`\\b${cmd}\\b`));
+  assert.ok(start >= 0 && byLayer > start, "gateway path should precede the layer grouping");
+  for (const cmd of ["login", "gateway create", "gateway connect", "gateway url", "gateway tools",
+                     "gateway call", "gateway receipts", "gateway logs"]) {
+    assert.ok(result.stdout.slice(start, byLayer).includes(cmd), `${cmd} missing from the gateway path`);
   }
-  // Layers with commands are shown; Context/Coordination are runtime-only now.
-  for (const layer of ["Identity", "Execution", "Observability"]) {
+  // How an agent connects, with both auth headers.
+  assert.match(result.stdout, /X-API-Key/);
+  assert.match(result.stdout, /Authorization: Bearer/);
+  for (const layer of ["Identity", "Context", "Coordination", "Execution", "Observability"]) {
     assert.match(result.stdout, new RegExp(`${layer} —`));
   }
-  // The deprecated tier collapses to one line and points at the web console.
-  assert.match(result.stdout, /deprecated \(still work/);
-  assert.match(result.stdout, /invokehq\.run\/dashboard/);
+  // No deprecated tier in the help any more, and the console link is one that resolves.
+  assert.doesNotMatch(result.stdout, /deprecated \(still work/);
+  assert.match(result.stdout, /console\.invokehq\.run\/sign-in/);
+  assert.doesNotMatch(result.stdout, /exactly-once/);
 });
 
-test("deprecated commands are hidden from the command list but still parse", () => {
+test("retired and deprecated commands are hidden from the command list", () => {
   const result = spawnSync(process.execPath, [binPath, "--help"], {
     cwd: repoRoot,
     env: isolatedEnv(),
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  const listing = result.stdout.split("the builder path")[0];
-  // e.g. "    approvals   List..." must NOT appear in the argparse command list.
-  for (const cmd of ["approvals", "preflight", "execute", "workflow"]) {
-    assert.doesNotMatch(listing, new RegExp(`\\n\\s+${cmd}\\s`));
+  const listing = result.stdout.split("start here")[0];
+  // e.g. "    run   Run an agent..." must NOT appear in the argparse command list.
+  for (const cmd of ["approvals", "preflight", "execute", "workflow", "init", "run", "logs", "inspect",
+                     "receipts", "graph", "replay", "deploy", "dev", "agents"]) {
+    assert.doesNotMatch(listing, new RegExp(`\\n\\s+${cmd}\\s`), cmd);
+  }
+  // ...while what still works stays listed.
+  for (const cmd of ["login", "status", "doctor", "config", "gateway", "wrap", "layers"]) {
+    assert.match(listing, new RegExp(`\\n\\s+${cmd}\\s`), cmd);
   }
 });
 
@@ -185,20 +194,41 @@ test("a deprecated command prints where it moved, then still runs", () => {
   assert.match(result.stderr, /Missing tool/);
 });
 
-test("the four builder-path commands are registered and parse", () => {
-  for (const cmd of ["inspect", "receipts", "graph", "replay"]) {
-    const result = spawnSync(process.execPath, [binPath, cmd, "--help"], {
-      cwd: repoRoot,
-      env: isolatedEnv(),
-      encoding: "utf8",
-    });
-    assert.equal(result.status, 0, `${cmd} --help failed: ${result.stderr}`);
-    assert.match(result.stdout, new RegExp(`usage: invoke ${cmd}`));
+// A dead port: a command that tried the network would fail with a connection error, not
+// with the retired-command answer these tests expect.
+function offlineEnv() {
+  return { ...envWithKey(), INVOKE_BASE_URL: "http://127.0.0.1:9" };
+}
+
+test("retired commands answer with their replacement and never reach the network", () => {
+  const replacements = {
+    init: /invoke gateway create/,
+    run: /invoke gateway url/,
+    logs: /invoke gateway logs/,
+    inspect: /invoke gateway receipts/,
+    receipts: /invoke gateway receipts/,
+    graph: /web console: https:\/\/console\.invokehq\.run/,
+    replay: /--idempotency-key/,
+  };
+  for (const [cmd, replacement] of Object.entries(replacements)) {
+    for (const argv of [[cmd], [cmd, "--help"], [cmd, "x", "--workspace", "ws_deadbeef"]]) {
+      const result = spawnSync(process.execPath, [binPath, ...argv], {
+        cwd: repoRoot,
+        env: offlineEnv(),
+        encoding: "utf8",
+      });
+      const said = `${argv.join(" ")}: ${result.stdout}${result.stderr}`;
+      assert.equal(result.status, 2, said);
+      assert.match(result.stderr, new RegExp("`" + cmd + "` was retired in 0\\.6"), said);
+      assert.match(result.stderr, replacement, said);
+      assert.doesNotMatch(result.stderr, /Connection refused|URLError|Could not reach/i, said);
+      assert.equal(result.stdout, "", said);
+    }
   }
 });
 
-test("receipts --verify exposes the ledger/receipt verification flag", () => {
-  const result = spawnSync(process.execPath, [binPath, "receipts", "--help"], {
+test("gateway receipts --verify exposes the receipt verification flag", () => {
+  const result = spawnSync(process.execPath, [binPath, "gateway", "receipts", "--help"], {
     cwd: repoRoot,
     env: isolatedEnv(),
     encoding: "utf8",
@@ -207,29 +237,30 @@ test("receipts --verify exposes the ledger/receipt verification flag", () => {
   assert.match(result.stdout, /--verify/);
 });
 
-test("trace and watch alias onto inspect and logs", () => {
-  // trace -> inspect, watch -> logs; both resolve a workspace, so with a key but no
-  // workspace they hit the same "select a workspace" error as their targets.
-  for (const alias of ["trace", "watch"]) {
+test("trace and watch still alias onto inspect and logs, which say what replaced them", () => {
+  for (const [alias, target] of [["trace", "inspect"], ["watch", "logs"]]) {
     const result = spawnSync(process.execPath, [binPath, alias], {
       cwd: repoRoot,
-      env: envWithKey(),
+      env: offlineEnv(),
       encoding: "utf8",
     });
-    assert.equal(result.status, 2, `${alias} should reach its target handler`);
-    assert.match(result.stderr, /No Invoke workspace selected/);
+    assert.equal(result.status, 2, `${alias}: ${result.stderr}`);
+    assert.match(result.stderr, new RegExp("`" + target + "` was retired in 0\\.6"));
   }
 });
 
-test("layers command includes the new builder-path commands", () => {
+test("layers lists the gateway commands and none of the retired ones", () => {
   const result = spawnSync(process.execPath, [binPath, "layers"], {
     cwd: repoRoot,
     env: isolatedEnv(),
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  for (const cmd of ["inspect", "receipts", "graph", "replay"]) {
-    assert.match(result.stdout, new RegExp(`\\b${cmd}\\b`));
+  for (const cmd of ["gateway create", "gateway url", "gateway connect", "gateway call", "gateway receipts"]) {
+    assert.ok(result.stdout.includes(cmd), cmd);
+  }
+  for (const cmd of ["init", "inspect", "graph", "replay", "deploy"]) {
+    assert.doesNotMatch(result.stdout, new RegExp(`(commands: |, )${cmd}\\b`), cmd);
   }
 });
 
@@ -255,29 +286,6 @@ test("auth is an alias for login", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /--api-key/);
-});
-
-test("run without a workspace explains how to provision one", () => {
-  const result = spawnSync(process.execPath, [binPath, "run", "support-agent"], {
-    cwd: repoRoot,
-    env: envWithKey(),
-    encoding: "utf8",
-  });
-
-  assert.equal(result.status, 2);
-  assert.match(result.stderr, /No Invoke workspace selected/);
-  assert.match(result.stderr, /invoke init/);
-});
-
-test("logs without a workspace explains how to provision one", () => {
-  const result = spawnSync(process.execPath, [binPath, "logs"], {
-    cwd: repoRoot,
-    env: envWithKey(),
-    encoding: "utf8",
-  });
-
-  assert.equal(result.status, 2);
-  assert.match(result.stderr, /No Invoke workspace selected/);
 });
 
 test("generated wrapper server.py is valid Python (real booleans, not JSON true/false)", () => {
@@ -431,17 +439,68 @@ test("config api-key masks by default and --reveal prints it in full", () => {
   assert.match(revealed.stdout, /ag_live_SECRET1234567890/);
 });
 
-test("runtime observability commands redirect a gateway (ws_) workspace id", () => {
-  for (const cmd of ["receipts", "logs", "graph", "inspect", "replay"]) {
-    const result = spawnSync(process.execPath, [binPath, cmd, "--workspace", "ws_deadbeef"], {
-      cwd: repoRoot,
-      env: envWithKey(),
-      encoding: "utf8",
-    });
-    assert.equal(result.status, 2, `${cmd}: ${result.stdout}${result.stderr}`);
-    assert.match(result.stderr, /gateway \(effect-ledger\) workspace/, cmd);
-    assert.match(result.stderr, /invoke gateway/, cmd);
-  }
+test("deprecated project commands still run, with a pointer to the gateway", () => {
+  const result = spawnSync(process.execPath, [binPath, "agents", "list"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /note: .*invoke gateway status/);
+  assert.match(result.stdout, /No Invoke projects deployed/);
+
+  const deploy = spawnSync(process.execPath, [binPath, "deploy", os.tmpdir()], {
+    cwd: repoRoot,
+    env: offlineEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(deploy.status, 2, deploy.stderr);
+  assert.match(deploy.stderr, /note: the local project flow/);
+  assert.match(deploy.stderr, /invoke gateway connect/);
+  assert.doesNotMatch(deploy.stderr, /invoke init/);
+});
+
+test("status points at the gateway, never at invoke init", () => {
+  const result = spawnSync(process.execPath, [binPath, "status"], {
+    cwd: repoRoot,
+    env: envWithKey(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /invoke gateway create/);
+  assert.doesNotMatch(result.stdout + result.stderr, /invoke init/);
+
+  const pinned = spawnSync(process.execPath, [binPath, "status"], {
+    cwd: repoRoot,
+    env: { ...envWithKey(), INVOKE_GATEWAY_WORKSPACE: "ws_pinned" },
+    encoding: "utf8",
+  });
+  assert.equal(pinned.status, 0, pinned.stderr);
+  assert.match(pinned.stdout, /Workspace: ws_pinned/);
+  assert.match(pinned.stdout, /invoke gateway status/);
+});
+
+test("gateway url tells you how to send the key, without touching the network", () => {
+  const result = spawnSync(process.execPath, [binPath, "gateway", "url", "--workspace", "ws_test"], {
+    cwd: repoRoot,
+    env: offlineEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), "http://127.0.0.1:9/v1/workspaces/ws_test/mcp");
+  assert.match(result.stderr, /X-API-Key/);
+  assert.match(result.stderr, /Authorization: Bearer/);
+  assert.match(result.stderr, /claude mcp add --transport http invoke http:\/\/127\.0\.0\.1:9\/v1\/workspaces\/ws_test\/mcp/);
+});
+
+test("--version reports 0.6.0", () => {
+  const result = spawnSync(process.execPath, [binPath, "--version"], {
+    cwd: repoRoot,
+    env: isolatedEnv(),
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout + result.stderr, /0\.6\.0/);
 });
 
 test("gateway --help lists the context and coordination subcommands", () => {
@@ -505,4 +564,47 @@ test("layers attributes gateway memory to the Context layer", () => {
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Context[\s\S]*gateway memory/);
+});
+
+// A fake gateway that records the JSON-RPC calls the CLI sends. The CLI runs with an async
+// spawn: spawnSync would block this process, and with it the server.
+async function againstFakeGateway(argv) {
+  const http = require("node:http");
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      const msg = JSON.parse(body || "{}");
+      seen.push({ headers: req.headers, msg });
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id ?? 1,
+        result: { content: [{ type: "text", text: "ok" }] } }));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const env = { ...envWithKey(), INVOKE_BASE_URL: `http://127.0.0.1:${server.address().port}` };
+  const result = await new Promise((resolve) => {
+    const child = require("node:child_process").spawn(process.execPath, [binPath, ...argv], { cwd: repoRoot, env });
+    let stdout = ""; let stderr = "";
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+  server.close();
+  return { result, calls: seen.filter((s) => s.msg.method === "tools/call") };
+}
+
+test("gateway call names no agent unless asked, so an agent's own key works", async () => {
+  const plain = await againstFakeGateway(["gateway", "call", "invoke_recall", "{}", "--workspace", "ws_test"]);
+  assert.equal(plain.result.status, 0, plain.result.stderr);
+  assert.equal(plain.calls.length, 1);
+  assert.equal(plain.calls[0].msg.params.name, "invoke_recall");
+  assert.ok(!("_agent_id" in plain.calls[0].msg.params.arguments), JSON.stringify(plain.calls[0].msg));
+  assert.equal(plain.calls[0].headers["x-api-key"], "inv_test_offline_key");
+
+  const named = await againstFakeGateway(["gateway", "call", "invoke_recall", "{}", "--workspace", "ws_test",
+                                          "--agent-id", "coder"]);
+  assert.equal(named.result.status, 0, named.result.stderr);
+  assert.equal(named.calls[0].msg.params.arguments._agent_id, "coder");
 });

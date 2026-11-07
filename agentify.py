@@ -1283,7 +1283,7 @@ def status_plain(base_url: str, api_key: str, check: bool) -> int:
     print(f"Runtime: {base_url}")
     print(f"API key: {mask_key(api_key)}")
     print(f"Config: {credentials_path()}")
-    print(f"Workspace: {stored_workspace() or '(none)'}")
+    print(f"Workspace: {os.getenv('INVOKE_GATEWAY_WORKSPACE') or stored_gateway_workspace() or '(none)'}")
     project = project_context(Path.cwd())
     print(f"Project: {project or '(none)'}")
     if check:
@@ -1297,54 +1297,24 @@ def status_plain(base_url: str, api_key: str, check: bool) -> int:
 
 
 def status_command(args: argparse.Namespace) -> int:
+    """Login and config context, plus the active gateway workspace. Since 0.6 it never reads
+    a runtime workspace: that API is retired, and asking it could only 404. The workspace
+    dashboard is `invoke gateway status`."""
     credentials = load_credentials()
     base_url = args.base_url or credentials["base_url"]
     api_key = args.api_key or credentials["api_key"]
-    creds = {"base_url": base_url, "api_key": api_key}
-
-    try:
-        workspace_id = load_workspace(args)
-    except CliUsageError:
-        workspace_id = None
-
-    if args.plain or not workspace_id:
-        if not workspace_id and not args.plain:
-            print("No workspace selected — showing login context. Run `invoke init <name>` to provision one.\n")
-        return status_plain(base_url, api_key, args.check)
-
-    if not api_key:
-        raise CliUsageError("Missing API key. Run `invoke login --api-key ...` or set INVOKE_API_KEY.")
-
-    health: dict[str, Any] = {}
-    try:
-        health = api_request("GET", base_url, "/health", api_key)
-    except RuntimeError:
-        health = {}
-    overview = runtime_request("GET", creds, workspace_id, "/overview").get("overview", {})
-    metrics = runtime_request("GET", creds, workspace_id, "/metrics?window_minutes=1440").get("metrics", {})
-
+    gateway_ws = os.getenv("INVOKE_GATEWAY_WORKSPACE") or stored_gateway_workspace()
     if args.json:
-        print(json.dumps({"health": health, "overview": overview, "metrics": metrics}, indent=2))
+        print(json.dumps({"version": package_version(), "base_url": base_url, "api_key": mask_key(api_key),
+                          "config": str(credentials_path()), "gateway_workspace": gateway_ws}, indent=2))
         return 0
-
-    totals = metrics.get("totals", {}) if isinstance(metrics, dict) else {}
-    agents = overview.get("agents", {}) if isinstance(overview, dict) else {}
-    approvals = overview.get("approvals", {}) if isinstance(overview, dict) else {}
-    ws_name = (overview.get("workspace") or {}).get("name") or workspace_id
-    recovery = 1.0 - float(totals.get("failure_rate", 0.0) or 0.0)
-    raw_health = str(health.get("status", "unknown")) if health else "unreachable"
-    health_status = {"ok": "Healthy"}.get(raw_health, raw_health.capitalize())
-
-    print(f"Workspace:        {ws_name} ({workspace_id})")
-    print(f"Runtime:          {health_status}")
-    print(f"Agents:           {agents.get('total', 0)} ({agents.get('live', 0)} live)")
-    print(f"Executions (24h): {int(totals.get('requested', 0)):,}")
-    print(f"Recovery Rate:    {fmt_pct(recovery)}")
-    print(f"Cost (24h):       {fmt_cost(totals.get('spend_micros', 0))}")
-    pending = approvals.get("pending", 0)
-    if pending:
-        print(f"Approvals:        {pending} pending  →  invoke approvals")
-    return 0
+    code = status_plain(base_url, api_key, args.check)
+    if gateway_ws:
+        print("Its dashboard: invoke gateway status")
+    else:
+        print("Next: make a workspace with `invoke gateway create <name>`, or pick one with "
+              "`invoke gateway use <id>`.")
+    return code
 
 
 def print_events(events: list[dict[str, Any]]) -> None:
@@ -2040,7 +2010,7 @@ def init_command(args: argparse.Namespace) -> int:
 def read_project(root: Path) -> dict[str, Any]:
     config_path = root / "invoke.json"
     if not config_path.exists():
-        raise ValueError(f"No invoke.json found in {root}. Run `invoke init <name>` first.")
+        raise ValueError(f"No invoke.json found in {root}. (Projects come from `invoke init` in CLI 0.5 and earlier; in 0.6, bring tools with `invoke gateway connect <name> <mcp-url>`.)")
     config = load_json_file(config_path, {})
     if not isinstance(config, dict):
         raise ValueError("invoke.json must contain an object")
@@ -2124,13 +2094,11 @@ def discover_deploy_candidates(root: Path) -> tuple[list[Path], list[Path]]:
 def missing_project_error(root: Path) -> CliUsageError:
     return CliUsageError(
         f"No invoke.json or agent entrypoint found in {root}.\n\n"
-        "Start a deployable agent:\n"
-        "  invoke init my-gemini-agent --template gemini-agent\n"
-        "  cd my-gemini-agent\n"
-        "  invoke deploy\n\n"
-        "Or deploy an existing agent project:\n"
-        "  invoke deploy ./my-gemini-agent\n\n"
-        "Invoke deploy will package the agent for Modal, inject tracing, and start Onyx supervision."
+        "In 0.6 the way in is the gateway — bring your tools to a workspace:\n"
+        "  invoke gateway create my-workspace\n"
+        "  invoke gateway connect <name> <mcp-url>\n\n"
+        "Or deploy a project made by an earlier version:\n"
+        "  invoke deploy ./my-project"
     )
 
 
@@ -2147,12 +2115,11 @@ def source_repo_deploy_error(root: Path, candidates: list[Path]) -> CliUsageErro
         candidate_lines = "\n\nDeploy one of the agent projects in this repo:\n" + "\n".join(choices)
     return CliUsageError(
         "You are in the Invoke CLI/backend source repo, not an agent project.\n\n"
-        "Start a deployable agent:\n"
-        "  invoke init my-gemini-agent --template gemini-agent\n"
-        "  cd my-gemini-agent\n"
-        "  invoke deploy\n\n"
-        "Or deploy an existing agent project:\n"
-        "  invoke deploy ./my-gemini-agent"
+        "In 0.6 the way in is the gateway — bring your tools to a workspace:\n"
+        "  invoke gateway create my-workspace\n"
+        "  invoke gateway connect <name> <mcp-url>\n\n"
+        "Or deploy a project made by an earlier version:\n"
+        "  invoke deploy ./my-project"
         f"{candidate_lines}\n\n"
         "This guard prevents accidentally deploying the Invoke backend as your agent."
     )
@@ -2752,56 +2719,83 @@ LAYERS: list[tuple[str, str]] = [
     ("Identity", "who each agent is, what it may do, what it may spend"),
     ("Context", "one governed source of truth every agent shares, with provenance"),
     ("Coordination", "agent-to-agent handoffs as a first-class, durable primitive"),
-    ("Execution", "every real action governed like a production transaction: exactly-once, authorized, reconciled, approved if risky, receipted"),
+    ("Execution", "every real action governed like a production transaction: deduplicated, authorized, reconciled, approved if risky, receipted"),
     ("Observability", "who did what, why, at what cost, and where the bottlenecks are"),
 ]
 
 # command -> (layer, one-line summary), used for the layered help view and `invoke layers`.
-# Deprecated commands are intentionally absent here (see DEPRECATED_COMMANDS) so they
-# stay out of the layer model and `invoke layers`.
+# Retired and deprecated commands are intentionally absent here (see RETIRED_COMMANDS and
+# DEPRECATED_COMMANDS) so they stay out of the help and `invoke layers`.
 COMMAND_LAYERS: dict[str, tuple[str, str]] = {
-    "login": ("Identity", "Authenticate and save runtime credentials"),
+    "login": ("Identity", "Save your Invoke API key"),
     "auth": ("Identity", "Authenticate (alias for login)"),
     "config": ("Identity", "Show or update CLI config"),
-    "agents": ("Identity", "List agents / projects deployed from this machine"),
-    "init": ("Execution", "Scaffold a project and provision a workspace"),
-    "deploy": ("Execution", "Deploy runtime, policies, agents, tools"),
-    "run": ("Execution", "Run an agent or a workflow file"),
-    "replay": ("Execution", "Re-run an execution with the same tool, params, and intent"),
-    "receipts": ("Execution", "List, show, and cryptographically verify signed run receipts"),
-    "wrap": ("Execution", "Generate a tool wrapper project"),
-    "dev": ("Execution", "Run a local MCP server for this project"),
-    "gateway": ("Execution", "Point at and drive the hosted MCP gateway (governed tool calls)"),
+    "gateway create": ("Identity", "Make a workspace for your agents and make it active"),
+    "gateway use": ("Identity", "Make an existing workspace active"),
     "gateway context": ("Context", "Read the shared entity context every agent sees, with provenance"),
     "gateway memory": ("Context", "Read/write the shared facts (ws_memory) every agent sees"),
     "gateway subscribe": ("Coordination", "Subscribe an agent to a broadcast topic"),
     "gateway broadcast": ("Coordination", "Publish an event to every subscribed agent"),
     "gateway inbox": ("Coordination", "Read the broadcasts delivered to an agent"),
-    "status": ("Observability", "Runtime health and workspace dashboard"),
-    "logs": ("Observability", "Show or follow the execution event log"),
-    "inspect": ("Observability", "Show a run's full story: pipeline, cost, and its ledger slice"),
-    "graph": ("Observability", "Render the workspace agent graph: agents, tasks, and recent runs"),
-    "doctor": ("Observability", "Diagnose credentials and runtime health"),
+    "gateway url": ("Execution", "The MCP URL to give your agent; its tool calls then go through Invoke"),
+    "gateway connect": ("Execution", "Bring a tool server (any MCP URL) into the workspace"),
+    "gateway tools": ("Execution", "List the tools your agents can call"),
+    "gateway call": ("Execution", "Call one tool through Invoke: checked, deduplicated, receipted"),
+    "wrap": ("Execution", "Generate an MCP server that wraps a database or an API"),
+    "gateway status": ("Observability", "The workspace at a glance: tools, budget, governed calls"),
+    "gateway receipts": ("Observability", "What your agents did, with signed receipts"),
+    "gateway logs": ("Observability", "Show or follow the workspace's event log"),
+    "status": ("Observability", "Show your login, config and active workspace"),
+    "doctor": ("Observability", "Check your credentials and the API's health"),
     "layers": ("Observability", "Explain the five Invoke layers"),
 }
 
-# The developer product in eight commands: what an AI engineer types between
-# `npm install -g @invokehq/cli` and a proven, replayable run. Everything
-# collaborative (approvals, policies, org, billing) lives in the web console.
-BUILDER_PATH: list[str] = [
-    "login", "init", "deploy", "run", "inspect", "receipts", "graph", "replay",
+# The developer product: what an engineer types between `npm install -g @invokehq/cli`
+# and their agent's tool calls going through Invoke. Everything collaborative
+# (approvals, policies, org, billing) lives in the web console.
+GATEWAY_PATH: list[str] = [
+    "login", "gateway create", "gateway connect", "gateway url",
+    "gateway tools", "gateway call", "gateway receipts", "gateway logs",
 ]
 
-# Legacy commands: still registered and functional, but hidden from the layer
-# help and stamped with a pointer to where the capability lives now.
+CONSOLE_URL = "https://console.invokehq.run/sign-in"
+SIGN_UP_URL = "https://console.invokehq.run/sign-up"
+DOCS_URL = "https://docs.invokehq.run"
+
+# Retired in 0.6. These ran on Invoke's old runtime API, which the hosted service no longer
+# serves, so against it they could only fail with a 404. main() answers each with its
+# replacement and exit code 2 before anything is parsed or sent. Their handlers stay in this
+# file for now: the builder path may come back on the workspace API.
+RETIRED_COMMANDS: dict[str, str] = {
+    "init": "make a workspace with `invoke gateway create <name>`, then bring tools with "
+            "`invoke gateway connect <name> <mcp-url>`.",
+    "run": "point your agent at `invoke gateway url`, or call one tool with `invoke gateway call <tool>`.",
+    "logs": "use `invoke gateway logs`.",
+    "inspect": "use `invoke gateway receipts` to list what ran, and `invoke gateway receipts <id>` for one.",
+    "receipts": "use `invoke gateway receipts` (add `--verify` to check a receipt's signature).",
+    "graph": f"the agent graph is in the web console: {CONSOLE_URL}",
+    "replay": "not available on the gateway yet. To retry a call safely, send it again with the same "
+              "`--idempotency-key`: it is answered with the first receipt instead of running twice.",
+}
+
+# Legacy commands: still registered and functional, but hidden from the help and stamped
+# with a pointer to where the capability lives now.
 DEPRECATED_COMMANDS: dict[str, str] = {
     "tools": "tool discovery moved behind the gateway — use `invoke gateway tools`.",
     "call": "call one tool through the governed gateway — use `invoke gateway call`.",
     "search": "legacy demo command — live context is moving into the workspace context API.",
-    "preflight": "preflight is now a pipeline stage — `invoke run` simulates policy before executing.",
-    "execute": "superseded — run an agent/workflow with `invoke run`, or one tool with `invoke gateway call`.",
+    "preflight": "policy is checked on every gateway call — use `invoke gateway call`.",
+    "execute": "superseded — call one tool with `invoke gateway call`.",
     "workflow": "legacy demo command — packaged workflows are moving to the web console.",
-    "approvals": "approvals are a team surface — review them in the web console: https://invokehq.run/dashboard",
+    "approvals": f"approvals are a team surface — review them in the web console: {CONSOLE_URL}",
+    # The local project flow (init -> dev -> deploy) is paused with `init`; these still work
+    # on a project made by an earlier version.
+    "deploy": "the local project flow (init → dev → deploy) is paused in 0.6 — bring tools with "
+              "`invoke gateway connect <name> <mcp-url>`.",
+    "dev": "the local project flow (init → dev → deploy) is paused in 0.6 — to serve a database or "
+           "an API as tools, see `invoke wrap`.",
+    "agents": "this lists projects deployed with `invoke deploy`; for your workspace, run "
+              "`invoke gateway status`.",
 }
 
 
@@ -2810,13 +2804,18 @@ def commands_for_layer(layer: str) -> list[tuple[str, str]]:
 
 
 def layered_epilog() -> str:
-    """Lead with the builder path (the developer product), then the full command set
-    grouped by layer, then a one-line deprecated tier and the web-console pointer."""
-    path_width = max(len(cmd) for cmd in BUILDER_PATH)
-    lines = ["the builder path — install, ship, prove:"]
-    for cmd in BUILDER_PATH:
+    """Lead with the gateway path (the developer product), then how an agent connects, then
+    the full command set grouped by layer, then the web-console pointer. Retired and
+    deprecated commands are not listed."""
+    path_width = max(len(cmd) for cmd in GATEWAY_PATH)
+    lines = ["start here — route your agent's tool calls through Invoke:"]
+    for cmd in GATEWAY_PATH:
         summary = COMMAND_LAYERS.get(cmd, ("", ""))[1]
         lines.append(f"  {cmd.ljust(path_width)}  {summary}")
+    lines.append("")
+    lines.append("your agent connects to `invoke gateway url` with your key in an X-API-Key (or")
+    lines.append("Authorization: Bearer) header: Claude Code, Cursor, LangGraph, the OpenAI Agents SDK,")
+    lines.append(f"any MCP client. No key yet? {SIGN_UP_URL}")
     lines.append("")
     lines.append("commands, by layer:")
     for name, definition in LAYERS:
@@ -2829,12 +2828,9 @@ def layered_epilog() -> str:
         for cmd, summary in commands:
             lines.append(f"    {cmd:<{col}} {summary}")
     lines.append("")
-    lines.append("deprecated (still work; each prints where it moved):")
-    lines.append(f"  {', '.join(sorted(DEPRECATED_COMMANDS))}")
-    lines.append("")
     lines.append("teams — approvals, policies, org, billing — live in the web console:")
-    lines.append("  https://invokehq.run/dashboard")
-    lines.append("Run `invoke layers` for the model, or `invoke <command> --help` for a command.")
+    lines.append(f"  {CONSOLE_URL}")
+    lines.append(f"Docs: {DOCS_URL}. Run `invoke layers` for the model, or `invoke <command> --help` for a command.")
     return "\n".join(lines)
 
 
@@ -2901,8 +2897,11 @@ def gateway_url_command(args: argparse.Namespace) -> int:
         return 0
     # URL alone on stdout so `$(invoke gateway url)` stays clean; guidance to stderr.
     print(url)
-    print("Paste this into Claude/Cursor/ChatGPT as an MCP server URL; every tool call "
-          "then routes through the gateway (dedup, blocking, shared context, receipts).",
+    print("Give this to your agent as an MCP server URL (Claude Code, Cursor, LangGraph, the OpenAI "
+          "Agents SDK, any MCP client), with your key in an `X-API-Key: <key>` or "
+          "`Authorization: Bearer <key>` header. Every tool call then routes through the gateway "
+          "(dedup, blocking, shared context, receipts).\n"
+          f"Claude Code: claude mcp add --transport http invoke {url} --header \"X-API-Key: $INVOKE_API_KEY\"",
           file=sys.stderr)
     return 0
 
@@ -2957,7 +2956,7 @@ def gateway_call_command(args: argparse.Namespace) -> int:
         raise CliUsageError(
             "Missing tool.\n"
             "Usage: invoke gateway call <tool> '<json_params>'\n"
-            "Example: invoke gateway call linear.create_issue '{\"title\":\"Fix retry\"}'"
+            "Example: invoke gateway call linear_create_issue '{\"title\":\"Fix retry\"}'"
         )
     try:
         arguments = json.loads(args.params)
@@ -2965,9 +2964,12 @@ def gateway_call_command(args: argparse.Namespace) -> int:
         raise ValueError(f"params must be valid JSON: {exc}") from exc
     if not isinstance(arguments, dict):
         raise CliUsageError("params must be a JSON object.")
-    # The gateway reads _agent_id / _idempotency_key out of the MCP call arguments.
+    # The gateway reads _agent_id / _idempotency_key out of the MCP call arguments. The agent is
+    # named only when asked: an agent's own key already decides who acts, and the gateway refuses
+    # a key that names anyone else, so a default name here made every agent-key call fail.
     arguments = dict(arguments)
-    arguments["_agent_id"] = args.agent_id
+    if args.agent_id:
+        arguments["_agent_id"] = args.agent_id
     if args.idempotency_key:
         arguments["_idempotency_key"] = args.idempotency_key
     envelope, error = gateway_mcp_rpc_raw(
@@ -2983,7 +2985,15 @@ def gateway_call_command(args: argparse.Namespace) -> int:
         print(f"Gateway blocked the call{label}: {error.get('message', 'blocked')}")
         return 1
     result = envelope.get("result") if isinstance(envelope, dict) else None
-    print(json.dumps(result if result is not None else {}, indent=2))
+    blocks = (result or {}).get("content") if isinstance(result, dict) else None
+    if isinstance(blocks, list) and blocks and all(
+            isinstance(b, dict) and b.get("type") == "text" for b in blocks):
+        # What the tool said, then Invoke's ids and receipt line, as plain lines a person
+        # reads (the full JSON-RPC envelope is `--json`).
+        for block in blocks:
+            print(block.get("text", ""))
+        return 1 if result.get("isError") else 0
+    print(json.dumps(result if result is not None else {}, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -3341,164 +3351,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {package_version()}")
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
-    login = subparsers.add_parser("login", help="Save Invoke runtime credentials.")
+    login = subparsers.add_parser("login", help="Save your Invoke API key.")
     login.add_argument("--base-url", default=DEFAULT_API_URL, help="Invoke runtime URL.")
     login.add_argument("--api-key", help="Invoke API key. If omitted, prompts interactively.")
     login.set_defaults(func=login_command)
 
-    status = subparsers.add_parser("status", help="Show login and project context.")
-    status.add_argument("--base-url", help="Override Invoke runtime URL.")
-    status.add_argument("--api-key", help="Override Invoke API key.")
-    status.add_argument("--check", action="store_true", help="Call /health and verify the runtime is reachable.")
-    status.add_argument("--workspace", help="Workspace id to inspect.")
-    status.add_argument("--plain", action="store_true", help="Show CLI/login context instead of the runtime dashboard.")
-    status.add_argument("--json", action="store_true", help="Print the raw status payload as JSON.")
-    status.set_defaults(func=status_command)
-
-    doctor = subparsers.add_parser("doctor", help="Check credentials and runtime health.")
-    doctor.add_argument("--base-url", help="Override Invoke runtime URL.")
-    doctor.add_argument("--api-key", help="Override Invoke API key.")
-    doctor.set_defaults(func=doctor_command)
-
-    config = subparsers.add_parser("config", help="Show or update CLI config.")
-    config.add_argument("key", nargs="?", help="Config key to read or update: base-url or api-key.")
-    config.add_argument("value", nargs="?", help="New config value.")
-    config.add_argument("--json", action="store_true", help="Print config as JSON with the API key masked.")
-    config.add_argument("--reveal", action="store_true", help="Print the API key in full instead of masked.")
-    config.set_defaults(func=config_command)
-
-    init = subparsers.add_parser("init", help="Scaffold an Invoke project.")
-    init.add_argument("name", help="Project directory/name.")
-    init.add_argument(
-        "--template",
-        choices=["gemini-agent", "claude-agent", "default", "linear", "crm-guardrail"],
-        default="gemini-agent",
-    )
-    init.add_argument("--force", action="store_true", help="Write into an existing non-empty directory.")
-    init.add_argument("--no-cloud", action="store_true", help="Skip provisioning a cloud runtime workspace.")
-    init.add_argument("--workspace-name", help="Name for the provisioned workspace (defaults to the project name).")
-    init.add_argument("--base-url", help="Override Invoke runtime URL.")
-    init.add_argument("--api-key", help="Override Invoke API key.")
-    init.set_defaults(func=init_command)
-
-    deploy = subparsers.add_parser("deploy", help="Register this project with an Invoke runtime.")
-    deploy.add_argument("path", nargs="?", default=".", help="Project directory containing invoke.json.")
-    deploy.add_argument("--base-url", help="Override Invoke runtime URL.")
-    deploy.add_argument("--api-key", help="Override Invoke API key.")
-    deploy.add_argument("--owner-email", help="Provider owner email.")
-    deploy.add_argument("--slug", help="Provider slug.")
-    deploy.add_argument("--mcp-url", help="Hosted MCP URL for registered tools.")
-    deploy.add_argument("--dry-run", action="store_true", help="Validate and print the deployment plan without calling the API.")
-    deploy.set_defaults(func=deploy_command)
-
-    dev = subparsers.add_parser("dev", help="Run a local MCP server for this Invoke project.")
-    dev.add_argument("path", nargs="?", default=".", help="Project directory containing invoke.json.")
-    dev.add_argument("--host", default="127.0.0.1")
-    dev.add_argument("--port", type=int, default=8787)
-    dev.add_argument("--dry-run", action="store_true", help="Print the local MCP URL without starting the server.")
-    dev.set_defaults(func=dev_command)
-
-    tools = subparsers.add_parser("tools", description="Deprecated: list available tools (use `invoke gateway tools`).")
-    tools.add_argument("query", nargs="?", help="Optional search query.")
-    tools.add_argument("--json", action="store_true", help="Print the full JSON response.")
-    tools.add_argument("--base-url", help="Override Invoke runtime URL.")
-    tools.add_argument("--api-key", help="Override Invoke API key.")
-    tools.set_defaults(func=tools_command)
-
-    call = subparsers.add_parser("call", description="Deprecated: call one tool (use `invoke gateway call`).")
-    call.add_argument("tool", nargs="?", help="Tool id, for example linear.create_issue.")
-    call.add_argument("params", nargs="?", default="{}", help="JSON params object.")
-    call.add_argument("--agent-id", default="cli_agent")
-    call.add_argument("--idempotency-key")
-    call.add_argument("--base-url", help="Override Invoke runtime URL.")
-    call.add_argument("--api-key", help="Override Invoke API key.")
-    call.set_defaults(func=call_command)
-
-    approvals = subparsers.add_parser(
-        "approvals",
-        description="Deprecated: approvals are a team surface — review them in the web console.",
-    )
-    approvals.add_argument(
-        "approvals_action",
-        nargs="?",
-        choices=["list", "approve", "reject"],
-        default="list",
-        help="Action to run. Defaults to list.",
-    )
-    approvals.add_argument("approval_id", nargs="?", help="Approval id for approve/reject.")
-    approvals.add_argument("--reviewed-by", default="cli", help="Reviewer name for approve/reject.")
-    approvals.add_argument("--json", action="store_true", help="Print the full JSON response.")
-    approvals.add_argument("--base-url", help="Override Invoke runtime URL.")
-    approvals.add_argument("--api-key", help="Override Invoke API key.")
-    approvals.set_defaults(func=approvals_command)
-
-    search = subparsers.add_parser("search", description="Deprecated: search live docs/context through Invoke.")
-    search.add_argument("query", help="Search query, for example 'latest MCP agent failures'.")
-    search.add_argument("--limit", type=int, default=5, help="Number of Exa results to return, 1-10.")
-    search.add_argument("--json", action="store_true", help="Print the full JSON response.")
-    search.add_argument("--base-url", help="Override Invoke runtime URL.")
-    search.add_argument("--api-key", help="Override Invoke API key.")
-    search.set_defaults(func=search_command)
-
-    preflight = subparsers.add_parser(
-        "preflight", description="Deprecated: preflight now runs inside `invoke run`'s pipeline."
-    )
-    preflight.add_argument("action", nargs="?", help="Action name, for example stripe.charge_customer.")
-    preflight.add_argument("params", nargs="?", default="{}", help="JSON params object.")
-    preflight.add_argument("--agent-id", default="cli_agent")
-    preflight.add_argument("--idempotency-key")
-    preflight.add_argument("--apply-safe-fixes", action="store_true", help="Apply recommended guardrails in the returned plan.")
-    preflight.add_argument("--json", action="store_true", help="Print the full JSON response.")
-    preflight.add_argument("--base-url", help="Override Invoke runtime URL.")
-    preflight.add_argument("--api-key", help="Override Invoke API key.")
-    preflight.set_defaults(func=preflight_command)
-
-    execute = subparsers.add_parser("execute", description="Deprecated: use `invoke run` or `invoke gateway call`.")
-    execute.add_argument("action", nargs="?", help="Action name, for example stripe.charge_customer.")
-    execute.add_argument("params", nargs="?", default="{}", help="JSON params object.")
-    execute.add_argument("--agent-id", default="cli_agent")
-    execute.add_argument("--idempotency-key")
-    execute.add_argument("--apply-safe-fixes", action="store_true", help="Apply recommended guardrails before returning the receipt.")
-    execute.add_argument("--preflight-only", action="store_true", help="Only run the pre-execution simulation.")
-    execute.add_argument("--json", action="store_true", help="Print the full JSON response.")
-    execute.add_argument("--base-url", help="Override Invoke runtime URL.")
-    execute.add_argument("--api-key", help="Override Invoke API key.")
-    execute.set_defaults(func=execute_command)
-
-    workflow = subparsers.add_parser("workflow", description="Deprecated: run a packaged Invoke workflow.")
-    workflow.add_argument(
-        "workflow",
-        choices=["safe-tool-execution", "live-context-retrieval", "failure-trace-visualization"],
-        help="Workflow id to run.",
-    )
-    workflow.add_argument("--query", help="Live-context query for Exa-backed workflows.")
-    workflow.add_argument("--limit", type=int, help="Search result limit for live-context workflows.")
-    workflow.add_argument("--params", help="Optional JSON params for the workflow.")
-    workflow.add_argument("--json", action="store_true", help="Print the full JSON response.")
-    workflow.add_argument("--base-url", help="Override Invoke runtime URL.")
-    workflow.add_argument("--api-key", help="Override Invoke API key.")
-    workflow.set_defaults(func=workflow_command)
-
-    agents = subparsers.add_parser("agents", help="Manage locally deployed Invoke projects.")
-    agents_subparsers = agents.add_subparsers(dest="agents_command", required=True)
-    agents_list = agents_subparsers.add_parser("list", help="List projects deployed from this machine.")
-    agents_list.add_argument("--json", action="store_true", help="Print JSON.")
-    agents_list.set_defaults(func=agents_list_command)
-
-    wrap = subparsers.add_parser("wrap", help="Generate a wrapper project.")
-    wrap.add_argument("target", help="postgresql, github, notion, linear, or a FastAPI/service name.")
-    wrap.add_argument("--query", help="SQL query for postgresql wrappers.")
-    wrap.add_argument("--database-url-env", default="DATABASE_URL", help="Env var used by generated PostgreSQL wrapper.")
-    wrap.add_argument("--allow-write", action="store_true", help="Allow non-read-only PostgreSQL statements.")
-    wrap.add_argument("--openapi", help="OpenAPI JSON file for FastAPI/service wrappers.")
-    wrap.add_argument("--base-url", default="http://localhost:8000", help="Base URL for generated HTTP wrappers.")
-    wrap.add_argument("--name", help="Human-friendly wrapper or tool name.")
-    wrap.add_argument("--description", help="Capability description.")
-    wrap.add_argument("--output", default="wrapped_tools", help="Output directory.")
-    wrap.set_defaults(func=wrap_command)
-
     gateway = subparsers.add_parser(
-        "gateway", help="Point at and drive the hosted MCP gateway (governed tool calls)."
+        "gateway", help="Start here: route your agents' tool calls through Invoke (see below)."
     )
     gateway_subparsers = gateway.add_subparsers(dest="gateway_action", required=True)
 
@@ -3552,7 +3411,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gw_call.add_argument("tool", nargs="?", help="Tool name, for example linear.create_issue.")
     gw_call.add_argument("params", nargs="?", default="{}", help="JSON params object.")
-    gw_call.add_argument("--agent-id", default="cli_agent")
+    gw_call.add_argument("--agent-id", help="Act as this registered agent. Leave it out with an agent's own key: the key decides who acts (naming anyone else is refused).")
     gw_call.add_argument("--idempotency-key")
     gw_call.add_argument("--workspace", help="Gateway workspace id (overrides the active one).")
     gw_call.add_argument("--json", action="store_true", help="Print the full JSON-RPC envelope.")
@@ -3659,6 +3518,157 @@ def build_parser() -> argparse.ArgumentParser:
     gw_inbox.add_argument("--api-key", help="Override Invoke API key.")
     gw_inbox.set_defaults(func=gateway_inbox_command)
 
+    status = subparsers.add_parser("status", help="Show your login, config and active workspace.")
+    status.add_argument("--base-url", help="Override Invoke runtime URL.")
+    status.add_argument("--api-key", help="Override Invoke API key.")
+    status.add_argument("--check", action="store_true", help="Call /health and verify the runtime is reachable.")
+    status.add_argument("--workspace", help="Workspace id to inspect.")
+    status.add_argument("--plain", action="store_true", help="Show CLI/login context instead of the runtime dashboard.")
+    status.add_argument("--json", action="store_true", help="Print the raw status payload as JSON.")
+    status.set_defaults(func=status_command)
+
+    doctor = subparsers.add_parser("doctor", help="Check your credentials and the API's health.")
+    doctor.add_argument("--base-url", help="Override Invoke runtime URL.")
+    doctor.add_argument("--api-key", help="Override Invoke API key.")
+    doctor.set_defaults(func=doctor_command)
+
+    config = subparsers.add_parser("config", help="Show or update CLI config.")
+    config.add_argument("key", nargs="?", help="Config key to read or update: base-url or api-key.")
+    config.add_argument("value", nargs="?", help="New config value.")
+    config.add_argument("--json", action="store_true", help="Print config as JSON with the API key masked.")
+    config.add_argument("--reveal", action="store_true", help="Print the API key in full instead of masked.")
+    config.set_defaults(func=config_command)
+
+    init = subparsers.add_parser("init", description="Retired in 0.6: use `invoke gateway create`.")
+    init.add_argument("name", help="Project directory/name.")
+    init.add_argument(
+        "--template",
+        choices=["gemini-agent", "claude-agent", "default", "linear", "crm-guardrail"],
+        default="gemini-agent",
+    )
+    init.add_argument("--force", action="store_true", help="Write into an existing non-empty directory.")
+    init.add_argument("--no-cloud", action="store_true", help="Skip provisioning a cloud runtime workspace.")
+    init.add_argument("--workspace-name", help="Name for the provisioned workspace (defaults to the project name).")
+    init.add_argument("--base-url", help="Override Invoke runtime URL.")
+    init.add_argument("--api-key", help="Override Invoke API key.")
+    init.set_defaults(func=init_command)
+
+    deploy = subparsers.add_parser("deploy", description="Deprecated: register an earlier-version project with Invoke.")
+    deploy.add_argument("path", nargs="?", default=".", help="Project directory containing invoke.json.")
+    deploy.add_argument("--base-url", help="Override Invoke runtime URL.")
+    deploy.add_argument("--api-key", help="Override Invoke API key.")
+    deploy.add_argument("--owner-email", help="Provider owner email.")
+    deploy.add_argument("--slug", help="Provider slug.")
+    deploy.add_argument("--mcp-url", help="Hosted MCP URL for registered tools.")
+    deploy.add_argument("--dry-run", action="store_true", help="Validate and print the deployment plan without calling the API.")
+    deploy.set_defaults(func=deploy_command)
+
+    dev = subparsers.add_parser("dev", description="Deprecated: run a local MCP server for an earlier-version project.")
+    dev.add_argument("path", nargs="?", default=".", help="Project directory containing invoke.json.")
+    dev.add_argument("--host", default="127.0.0.1")
+    dev.add_argument("--port", type=int, default=8787)
+    dev.add_argument("--dry-run", action="store_true", help="Print the local MCP URL without starting the server.")
+    dev.set_defaults(func=dev_command)
+
+    tools = subparsers.add_parser("tools", description="Deprecated: list available tools (use `invoke gateway tools`).")
+    tools.add_argument("query", nargs="?", help="Optional search query.")
+    tools.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    tools.add_argument("--base-url", help="Override Invoke runtime URL.")
+    tools.add_argument("--api-key", help="Override Invoke API key.")
+    tools.set_defaults(func=tools_command)
+
+    call = subparsers.add_parser("call", description="Deprecated: call one tool (use `invoke gateway call`).")
+    call.add_argument("tool", nargs="?", help="Tool id, for example linear.create_issue.")
+    call.add_argument("params", nargs="?", default="{}", help="JSON params object.")
+    call.add_argument("--agent-id", default="cli_agent")
+    call.add_argument("--idempotency-key")
+    call.add_argument("--base-url", help="Override Invoke runtime URL.")
+    call.add_argument("--api-key", help="Override Invoke API key.")
+    call.set_defaults(func=call_command)
+
+    approvals = subparsers.add_parser(
+        "approvals",
+        description="Deprecated: approvals are a team surface — review them in the web console.",
+    )
+    approvals.add_argument(
+        "approvals_action",
+        nargs="?",
+        choices=["list", "approve", "reject"],
+        default="list",
+        help="Action to run. Defaults to list.",
+    )
+    approvals.add_argument("approval_id", nargs="?", help="Approval id for approve/reject.")
+    approvals.add_argument("--reviewed-by", default="cli", help="Reviewer name for approve/reject.")
+    approvals.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    approvals.add_argument("--base-url", help="Override Invoke runtime URL.")
+    approvals.add_argument("--api-key", help="Override Invoke API key.")
+    approvals.set_defaults(func=approvals_command)
+
+    search = subparsers.add_parser("search", description="Deprecated: search live docs/context through Invoke.")
+    search.add_argument("query", help="Search query, for example 'latest MCP agent failures'.")
+    search.add_argument("--limit", type=int, default=5, help="Number of Exa results to return, 1-10.")
+    search.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    search.add_argument("--base-url", help="Override Invoke runtime URL.")
+    search.add_argument("--api-key", help="Override Invoke API key.")
+    search.set_defaults(func=search_command)
+
+    preflight = subparsers.add_parser(
+        "preflight", description="Deprecated: preflight now runs inside `invoke run`'s pipeline."
+    )
+    preflight.add_argument("action", nargs="?", help="Action name, for example stripe.charge_customer.")
+    preflight.add_argument("params", nargs="?", default="{}", help="JSON params object.")
+    preflight.add_argument("--agent-id", default="cli_agent")
+    preflight.add_argument("--idempotency-key")
+    preflight.add_argument("--apply-safe-fixes", action="store_true", help="Apply recommended guardrails in the returned plan.")
+    preflight.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    preflight.add_argument("--base-url", help="Override Invoke runtime URL.")
+    preflight.add_argument("--api-key", help="Override Invoke API key.")
+    preflight.set_defaults(func=preflight_command)
+
+    execute = subparsers.add_parser("execute", description="Deprecated: use `invoke run` or `invoke gateway call`.")
+    execute.add_argument("action", nargs="?", help="Action name, for example stripe.charge_customer.")
+    execute.add_argument("params", nargs="?", default="{}", help="JSON params object.")
+    execute.add_argument("--agent-id", default="cli_agent")
+    execute.add_argument("--idempotency-key")
+    execute.add_argument("--apply-safe-fixes", action="store_true", help="Apply recommended guardrails before returning the receipt.")
+    execute.add_argument("--preflight-only", action="store_true", help="Only run the pre-execution simulation.")
+    execute.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    execute.add_argument("--base-url", help="Override Invoke runtime URL.")
+    execute.add_argument("--api-key", help="Override Invoke API key.")
+    execute.set_defaults(func=execute_command)
+
+    workflow = subparsers.add_parser("workflow", description="Deprecated: run a packaged Invoke workflow.")
+    workflow.add_argument(
+        "workflow",
+        choices=["safe-tool-execution", "live-context-retrieval", "failure-trace-visualization"],
+        help="Workflow id to run.",
+    )
+    workflow.add_argument("--query", help="Live-context query for Exa-backed workflows.")
+    workflow.add_argument("--limit", type=int, help="Search result limit for live-context workflows.")
+    workflow.add_argument("--params", help="Optional JSON params for the workflow.")
+    workflow.add_argument("--json", action="store_true", help="Print the full JSON response.")
+    workflow.add_argument("--base-url", help="Override Invoke runtime URL.")
+    workflow.add_argument("--api-key", help="Override Invoke API key.")
+    workflow.set_defaults(func=workflow_command)
+
+    agents = subparsers.add_parser("agents", description="Deprecated: list projects deployed from this machine.")
+    agents_subparsers = agents.add_subparsers(dest="agents_command", required=True)
+    agents_list = agents_subparsers.add_parser("list", help="List projects deployed from this machine.")
+    agents_list.add_argument("--json", action="store_true", help="Print JSON.")
+    agents_list.set_defaults(func=agents_list_command)
+
+    wrap = subparsers.add_parser("wrap", help="Generate an MCP server that wraps a database or an API.")
+    wrap.add_argument("target", help="postgresql, github, notion, linear, or a FastAPI/service name.")
+    wrap.add_argument("--query", help="SQL query for postgresql wrappers.")
+    wrap.add_argument("--database-url-env", default="DATABASE_URL", help="Env var used by generated PostgreSQL wrapper.")
+    wrap.add_argument("--allow-write", action="store_true", help="Allow non-read-only PostgreSQL statements.")
+    wrap.add_argument("--openapi", help="OpenAPI JSON file for FastAPI/service wrappers.")
+    wrap.add_argument("--base-url", default="http://localhost:8000", help="Base URL for generated HTTP wrappers.")
+    wrap.add_argument("--name", help="Human-friendly wrapper or tool name.")
+    wrap.add_argument("--description", help="Capability description.")
+    wrap.add_argument("--output", default="wrapped_tools", help="Output directory.")
+    wrap.set_defaults(func=wrap_command)
+
     layers = subparsers.add_parser("layers", help="Explain the five Invoke layers.")
     layers.add_argument("--json", action="store_true", help="Print the layer model as JSON.")
     layers.set_defaults(func=layers_command)
@@ -3668,7 +3678,7 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--api-key", help="Invoke API key. If omitted, prompts interactively.")
     auth.set_defaults(func=login_command)
 
-    run = subparsers.add_parser("run", help="Run an agent or a workflow file.")
+    run = subparsers.add_parser("run", description="Retired in 0.6: use `invoke gateway url` or `invoke gateway call`.")
     run.add_argument("target", help="Agent name, or path to a workflow .yaml/.yml/.json file.")
     run.add_argument("--params", default="{}", help="JSON params/input for the run.")
     run.add_argument("--agent-id", default="cli_agent", help="Requesting agent id.")
@@ -3679,7 +3689,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--api-key", help="Override Invoke API key.")
     run.set_defaults(func=run_command)
 
-    logs = subparsers.add_parser("logs", help="Show or follow the execution event log.")
+    logs = subparsers.add_parser("logs", description="Retired in 0.6: use `invoke gateway logs`.")
     logs.add_argument("--workspace", help="Workspace id to read.")
     logs.add_argument("-f", "--follow", action="store_true", help="Stream new events as they occur.")
     logs.add_argument("--limit", type=int, default=50, help="Max events to show (default 50).")
@@ -3697,7 +3707,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--api-key", help="Override Invoke API key.")
 
     inspect_parser = subparsers.add_parser(
-        "inspect", help="Show a run's full story: pipeline, cost, and its exact ledger slice."
+        "inspect", description="Retired in 0.6: use `invoke gateway receipts`."
     )
     inspect_parser.add_argument("execution_id", nargs="?", default="last",
                                 help="Execution id, or 'last' (default).")
@@ -3705,7 +3715,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.set_defaults(func=inspect_command)
 
     receipts = subparsers.add_parser(
-        "receipts", help="List, show, and cryptographically verify signed run receipts."
+        "receipts", description="Retired in 0.6: use `invoke gateway receipts`."
     )
     receipts.add_argument("receipt_id", nargs="?", help="Receipt id to show (omit to list).")
     receipts.add_argument("--verify", action="store_true",
@@ -3718,7 +3728,7 @@ def build_parser() -> argparse.ArgumentParser:
     receipts.set_defaults(func=receipts_command)
 
     graph = subparsers.add_parser(
-        "graph", help="Render the workspace agent graph: agents, their tasks, and recent runs."
+        "graph", description="Retired in 0.6: see the web console."
     )
     graph.add_argument("--limit", type=int, default=50, help="Recent executions to fold in.")
     graph.add_argument("--runs", type=int, default=5, help="Runs to show per agent.")
@@ -3726,7 +3736,7 @@ def build_parser() -> argparse.ArgumentParser:
     graph.set_defaults(func=graph_command)
 
     replay = subparsers.add_parser(
-        "replay", help="Re-run an execution with the same tool, params, and intent."
+        "replay", description="Retired in 0.6."
     )
     replay.add_argument("execution_id", nargs="?", default="last",
                         help="Execution id, or 'last' (default).")
@@ -3750,6 +3760,14 @@ def main(argv: list[str] | None = None) -> int:
     }
     if raw_args and raw_args[0] in aliases:
         raw_args[0] = aliases[raw_args[0]]
+    if raw_args and raw_args[0] in RETIRED_COMMANDS:
+        # Answered before parsing, so `invoke run --help` or `invoke init` without a name gets
+        # the replacement too, and nothing is sent to an API that would only 404.
+        print(f"invoke: `{raw_args[0]}` was retired in 0.6. It ran on Invoke's old runtime API, "
+              f"which the hosted service no longer serves.\n"
+              f"Instead: {RETIRED_COMMANDS[raw_args[0]]}\n"
+              f"Start here: invoke --help", file=sys.stderr)
+        return 2
     args = parser.parse_args(raw_args)
     note = DEPRECATED_COMMANDS.get(getattr(args, "command", "") or "")
     if note:

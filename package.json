@@ -1,7 +1,7 @@
 {
   "name": "@invokehq/cli",
-  "version": "0.5.1",
-  "description": "CLI for Invoke, execution reliability infrastructure for AI agents.",
+  "version": "0.6.0",
+  "description": "CLI for Invoke: route your AI agents' tool calls through a governed MCP gateway, with receipts.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
