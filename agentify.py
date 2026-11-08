@@ -2744,7 +2744,7 @@ COMMAND_LAYERS: dict[str, tuple[str, str]] = {
     "wrap": ("Execution", "Generate an MCP server that wraps a database or an API"),
     "gateway status": ("Observability", "The workspace at a glance: tools, budget, governed calls"),
     "gateway receipts": ("Observability", "What your agents did, with signed receipts"),
-    "gateway logs": ("Observability", "Show or follow the workspace's event log"),
+    "gateway logs": ("Observability", "Show the workspace's event log, filtered by --type"),
     "status": ("Observability", "Show your login, config and active workspace"),
     "doctor": ("Observability", "Check your credentials and the API's health"),
     "layers": ("Observability", "Explain the five Invoke layers"),

@@ -1,7 +1,12 @@
 name: Publish @invokehq/cli
 
 # Publish is tag-gated (not push-to-main) so a routine commit can never
-# republish the package. Cut a release by pushing a tag: `git tag v0.2.24 && git push --tags`.
+# republish the package. Cut a release by pushing a tag: `git tag v0.6.1 && git push origin v0.6.1`.
+#
+# Authentication is npm trusted publishing (OIDC): npm trusts this workflow in this repository,
+# so there is no npm token to store, expire or leak, and npm attaches a provenance statement.
+# Set up once at npmjs.com → @invokehq/cli → Settings → Trusted Publisher → GitHub Actions:
+# owner joel4893, repository Invoke, workflow publish.yml.
 on:
   push:
     tags:
@@ -10,23 +15,25 @@ on:
 
 permissions:
   contents: read
+  id-token: write  # the OIDC token npm exchanges for a short-lived publish credential
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: '18'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
+
+      - name: npm with trusted publishing (11.5.1 or later)
+        run: npm install -g npm@latest && npm --version
 
       - name: Run CLI smoke tests
         run: npm test

@@ -160,6 +160,8 @@ test("top-level help leads with the gateway path, then groups by layer", () => {
   assert.doesNotMatch(result.stdout, /deprecated \(still work/);
   assert.match(result.stdout, /console\.invokehq\.run\/sign-in/);
   assert.doesNotMatch(result.stdout, /exactly-once/);
+  // gateway logs has --type and --limit, no follow mode: the help must not offer one.
+  assert.doesNotMatch(result.stdout, /Show or follow/);
 });
 
 test("retired and deprecated commands are hidden from the command list", () => {
@@ -493,14 +495,14 @@ test("gateway url tells you how to send the key, without touching the network", 
   assert.match(result.stderr, /claude mcp add --transport http invoke http:\/\/127\.0\.0\.1:9\/v1\/workspaces\/ws_test\/mcp/);
 });
 
-test("--version reports 0.6.0", () => {
+test("--version reports 0.6.1", () => {
   const result = spawnSync(process.execPath, [binPath, "--version"], {
     cwd: repoRoot,
     env: isolatedEnv(),
     encoding: "utf8",
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout + result.stderr, /0\.6\.0/);
+  assert.match(result.stdout + result.stderr, /0\.6\.1/);
 });
 
 test("gateway --help lists the context and coordination subcommands", () => {

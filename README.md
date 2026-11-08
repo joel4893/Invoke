@@ -94,7 +94,7 @@ name, and every receipt names the agent that acted.
 | `invoke gateway tools` | List the tools your agents can call |
 | `invoke gateway call <tool> '<json>'` | Call one tool through Invoke. Add `--idempotency-key` to make a retry safe |
 | `invoke gateway receipts [<id>]` | What ran, with signed receipts. `--verify` checks a receipt's signature |
-| `invoke gateway logs` | Show or follow the workspace's event log |
+| `invoke gateway logs` | Show the workspace's event log (`--type` to filter, `--limit` for more) |
 | `invoke gateway status` | The workspace at a glance: tools, budget, governed calls |
 | `invoke gateway context` / `memory` | The shared context and facts every agent sees |
 | `invoke gateway subscribe` / `broadcast` / `inbox` | Agent-to-agent messages |
